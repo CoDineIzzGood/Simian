@@ -1,0 +1,1 @@
+# generates modules as packages for pyinstaller

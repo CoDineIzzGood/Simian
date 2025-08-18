@@ -1,29 +1,49 @@
-import os, importlib, json, pathlib
+import importlib, os, pkgutil, json
 
-ROOT = pathlib.Path(__file__).parent
+expected_dirs = [
+  "data", "data/uploads", "data/clips",
+  "gui", "routes", "modules", "services", "voice",
+  "memory"
+]
 
-def exists(path): return (ROOT / path).exists()
+expected_files = [
+  "simian_launcher.py", "simian_launcher.spec",
+  "gui/simian_gui.py",
+  "modules/screen_recorder.py",
+  "services/file_scanner.py",
+  "routes/gui.py",
+]
 
-dirs = ["data","data/uploads","data/clips","gui","routes","modules","services","voice","memory"]
-files = ["simian_launcher.py","simian_launcher.spec","gui/simian_gui.py","modules/screen_recorder.py","services/file_scanner.py","routes/chat.py"]
+report = {
+  "cwd": os.getcwd(),
+  "dirs": {},
+  "files": {},
+  "imports": {},
+  "chat_route_file_guess": None
+}
 
-imports = {}
-def try_import(name):
+for d in expected_dirs:
+    report["dirs"][d] = os.path.isdir(d)
+
+for f in expected_files:
+    report["files"][f] = os.path.isfile(f)
+
+for mod in ["gui.simian_gui","modules.screen_recorder","services.file_scanner","routes.gui"]:
     try:
-        importlib.invalidate_caches()
-        importlib.import_module(name)
-        return "OK"
+        importlib.import_module(mod)
+        report["imports"][mod] = "OK"
     except Exception as e:
-        return f"ERROR: {e}"
+        report["imports"][mod] = f"ERROR: {e.__class__.__name__}: {e}"
 
-imports["gui.simian_gui"] = try_import("gui.simian_gui")
-imports["modules.screen_recorder"] = try_import("modules.screen_recorder")
-imports["services.file_scanner"] = try_import("services.file_scanner")
-imports["routes.chat"] = try_import("routes.chat")
+# try to guess which routes file defines /chat
+guess = None
+if os.path.isdir("routes"):
+    for _, name, _ in pkgutil.iter_modules(["routes"]):
+        if name in ("gpt","chat","api"):
+            candidate = os.path.join("routes", f"{name}.py")
+            if os.path.exists(candidate):
+                guess = candidate
+                break
+report["chat_route_file_guess"] = guess
 
-print(json.dumps({
-  "cwd": str(ROOT),
-  "dirs": {d: exists(d) for d in dirs},
-  "files": {f: exists(f) for f in files},
-  "imports": imports
-}, indent=2))
+print(json.dumps(report, indent=2))
