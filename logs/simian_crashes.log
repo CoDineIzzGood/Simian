@@ -1,0 +1,205 @@
+
+--- CRASH @ 2025-08-05 16:47:15 ---
+Module: simian_gui
+Traceback (most recent call last):
+  File "simian_launcher.py", line 26, in <module>
+    from gui.simian_gui import launch_gui
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "gui\simian_gui.py", line 23, in <module>
+    from vosk import Model, KaldiRecognizer
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "vosk\__init__.py", line 36, in <module>
+  File "vosk\__init__.py", line 27, in open_dll
+  File "os.py", line 1118, in add_dll_directory
+FileNotFoundError: [WinError 2] The system cannot find the file specified: 'C:\\Users\\Alexander Munson\\OneDrive\\Desktop\\Project C.H.I.M.P\\Simian\\dist\\Simian\\_internal\\vosk'
+
+
+--- CRASH @ 2025-08-05 16:47:15 ---
+Module: mic_listener
+Traceback (most recent call last):
+  File "simian_launcher.py", line 33, in <module>
+    from voice import mic_listener
+ImportError: cannot import name 'mic_listener' from 'voice' (C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\voice\__init__.py)
+
+
+--- CRASH @ 2025-08-05 16:47:24 ---
+Module: main
+Traceback (most recent call last):
+  File "simian_launcher.py", line 40, in <module>
+    from main import app as fastapi_app
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "main.py", line 4, in <module>
+    from routes.ml_route import router as ml_router
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "routes\ml_route.py", line 3, in <module>
+    from ml_engine.model_manager import select_best_model
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "ml_engine\model_manager.py", line 5, in <module>
+    from ml_engine.train_utils import (
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "ml_engine\train_utils.py", line 1, in <module>
+    from ml_engine.xgboost_model import train_xgboost
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "ml_engine\xgboost_model.py", line 1, in <module>
+    import xgboost as xgb
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "xgboost\__init__.py", line 6, in <module>
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "xgboost\tracker.py", line 9, in <module>
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "xgboost\core.py", line 295, in <module>
+  File "xgboost\core.py", line 229, in _load_lib
+  File "xgboost\libpath.py", line 77, in find_lib_path
+xgboost.libpath.XGBoostLibraryNotFound: Cannot find XGBoost Library in the candidate path.  List of candidates:
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\xgboost\lib\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\xgboost\..\..\lib\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\lib\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\bin\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\Library\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\Library\bin\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\Library\lib\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\Library\mingw-w64\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\Library\mingw-w64\bin\xgboost.dll
+- C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\Library\mingw-w64\lib\xgboost.dll
+XGBoost Python package path: C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\xgboost
+sys.base_prefix: C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal
+See: https://xgboost.readthedocs.io/en/stable/install.html for installing XGBoost.
+
+
+--- CRASH @ 2025-08-06 01:08:10 ---
+Module: simian_gui
+Traceback (most recent call last):
+  File "simian_launcher.py", line 41, in <module>
+    from gui.simian_gui import launch_gui
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "gui\simian_gui.py", line 21, in <module>
+    from screen_recorder import start_recording
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "screen_recorder.py", line 4, in <module>
+    import pyautogui
+ModuleNotFoundError: No module named 'pyautogui'
+
+
+--- CRASH @ 2025-08-06 01:08:10 ---
+Module: mic_listener
+Traceback (most recent call last):
+  File "simian_launcher.py", line 47, in <module>
+    from voice import mic_listener
+ImportError: cannot import name 'mic_listener' from 'voice' (C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\voice\__init__.py)
+
+
+--- CRASH @ 2025-08-06 01:08:10 ---
+Module: main
+Traceback (most recent call last):
+  File "simian_launcher.py", line 53, in <module>
+    from main import app as fastapi_app
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "main.py", line 3, in <module>
+    from routes import chat, screen, gui, context, ml, voice, cli
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "routes\screen.py", line 7, in <module>
+    from modules import screen_recorder, gui_toggle, context_memory, ml_model
+ImportError: cannot import name 'screen_recorder' from 'modules' (unknown location)
+
+
+--- CRASH @ 2025-08-06 01:33:31 ---
+Module: simian_gui
+Traceback (most recent call last):
+  File "simian_launcher.py", line 41, in <module>
+    from gui.simian_gui import launch_gui
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "gui\simian_gui.py", line 21, in <module>
+    from screen_recorder import start_recording
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "screen_recorder.py", line 34, in <module>
+    from PyQt5.QtWidgets import QApplication, QWidget, QPushButton
+ModuleNotFoundError: No module named 'PyQt5'
+
+
+--- CRASH @ 2025-08-06 01:33:31 ---
+Module: mic_listener import
+Traceback (most recent call last):
+  File "simian_launcher.py", line 47, in <module>
+    from voice import mic_listener
+ImportError: cannot import name 'mic_listener' from 'voice' (C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\voice\__init__.py)
+
+
+--- CRASH @ 2025-08-06 01:33:31 ---
+Module: main
+Traceback (most recent call last):
+  File "simian_launcher.py", line 54, in <module>
+    from main import app as fastapi_app
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "main.py", line 3, in <module>
+    from routes import chat, screen, gui, context, ml, voice, cli
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "routes\screen.py", line 7, in <module>
+    from modules import screen_recorder, gui_toggle, context_memory, ml_model
+ImportError: cannot import name 'screen_recorder' from 'modules' (unknown location)
+
+
+--- CRASH @ 2025-08-06 11:57:32 ---
+Module: simian_gui
+Traceback (most recent call last):
+  File "simian_launcher.py", line 41, in <module>
+    from gui.simian_gui import launch_gui
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "gui\simian_gui.py", line 21, in <module>
+    from screen_recorder import start_recording
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "screen_recorder.py", line 34, in <module>
+    from PyQt5.QtWidgets import QApplication, QWidget, QPushButton
+ModuleNotFoundError: No module named 'PyQt5'
+
+
+--- CRASH @ 2025-08-06 11:57:32 ---
+Module: mic_listener import
+Traceback (most recent call last):
+  File "simian_launcher.py", line 47, in <module>
+    from voice import mic_listener
+ImportError: cannot import name 'mic_listener' from 'voice' (C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\dist\Simian\_internal\voice\__init__.py)
+
+
+--- CRASH @ 2025-08-06 11:57:32 ---
+Module: main
+Traceback (most recent call last):
+  File "simian_launcher.py", line 54, in <module>
+    from main import app as fastapi_app
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "main.py", line 3, in <module>
+    from routes import chat, screen, gui, context, ml, voice, cli
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "routes\screen.py", line 7, in <module>
+    from modules import screen_recorder, gui_toggle, context_memory, ml_model
+ImportError: cannot import name 'screen_recorder' from 'modules' (unknown location)
+

@@ -1,0 +1,20 @@
+=== BOOTSTRAP CRASH ===
+Traceback (most recent call last):
+  File "C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\listener_bootstrap.py", line 74, in <module>
+    wait_for_wake()
+  File "C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\listener_bootstrap.py", line 52, in wait_for_wake
+    data = audio_queue.get()
+  File "C:\Users\Alexander Munson\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171, in get
+    self.not_empty.wait()
+  File "C:\Users\Alexander Munson\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320, in wait
+    waiter.acquire()
+KeyboardInterrupt
+=== BOOTSTRAP CRASH ===
+Traceback (most recent call last):
+  File "C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\listener_bootstrap.py", line 74, in <module>
+  File "C:\Users\Alexander Munson\OneDrive\Desktop\Project C.H.I.M.P\Simian\listener_bootstrap.py", line 52, in wait_for_wake
+  File "C:\Users\Alexander Munson\AppData\Local\Programs\Python\Python310\lib\queue.py", line 171, in get
+    self.not_empty.wait()
+  File "C:\Users\Alexander Munson\AppData\Local\Programs\Python\Python310\lib\threading.py", line 320, in wait
+    waiter.acquire()
+KeyboardInterrupt

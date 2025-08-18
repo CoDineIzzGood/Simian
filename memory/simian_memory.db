@@ -1,0 +1,19 @@
+{
+    "conversations": [],
+    "short_term": {},
+    "long_term": {},
+    "voice_commands": [
+        {
+            "timestamp": "2025-08-05 15:43:54",
+            "command": "clip that"
+        },
+        {
+            "timestamp": "2025-08-05 16:03:41",
+            "command": "clip that"
+        },
+        {
+            "timestamp": "2025-08-05 16:47:15",
+            "command": "clip that"
+        }
+    ]
+}
