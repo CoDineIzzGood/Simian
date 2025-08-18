@@ -1,1 +1,11 @@
 xgboost\lib\xgboost.dll
+.env
+data/
+*.log
+__pycache__/
+.venv/
+venv/
+*.pyc
+*.mp4
+*.wav
+*.png
