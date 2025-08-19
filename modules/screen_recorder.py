@@ -1,87 +1,123 @@
-# modules/screen_recorder.py
-"""
-Screen recorder using ffmpeg (gdigrab on Windows). No mss, no thread-local errors.
-Writes MP4 clips into data/clips/. Auto-rotates files by timestamp.
-"""
-from __future__ import annotations
-import os, subprocess, datetime, threading, shlex, sys, signal
+
+import os
+import time
+import threading
 from pathlib import Path
+from typing import Optional, List
 
-IS_WIN = os.name == "nt"
-FFMPEG_PATH = os.path.join(os.path.dirname(__file__), "..", "ffmpeg-7.1.1", "bin", "ffmpeg.exe") if IS_WIN else "ffmpeg"
+import numpy as np
 
-CLIPS_DIR = Path(__file__).resolve().parents[1] / "data" / "clips"
-CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    import dxcam  # type: ignore
+    HAS_DXCAM = True
+except Exception:
+    HAS_DXCAM = False
 
-class Recorder:
-    def __init__(self, fps:int=30, q:int=25, monitor:str="desktop"):
+try:
+    import mss  # type: ignore
+    import mss.tools  # noqa
+    HAS_MSS = True
+except Exception:
+    HAS_MSS = False
+
+import cv2  # type: ignore
+
+class ScreenRecorder:
+    def __init__(self, clips_dir: str, fps: int = 15, monitor_indexes: Optional[List[int]] = None):
+        self.clips_dir = Path(clips_dir)
         self.fps = fps
-        self.q = q
-        self.monitor = monitor
-        self.proc: subprocess.Popen | None = None
-        self.filepath: Path | None = None
-        self._lock = threading.Lock()
+        self.monitor_indexes = monitor_indexes  # None -> all
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self.last_clip_path: Optional[Path] = None
 
-    def _next_filepath(self)->Path:
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        return CLIPS_DIR / f"simian_{ts}.mp4"
+    def _get_monitors_dxcam(self):
+        cam = dxcam.create(output_idx=0)
+        monitors = dxcam.device_info()["outputs"]
+        idxs = self.monitor_indexes or list(range(len(monitors)))
+        return idxs, monitors
+
+    def _frame_from_dxcam(self, idxs):
+        frames = []
+        for i in idxs:
+            cam = dxcam.create(output_idx=i)
+            frame = cam.grab()
+            if frame is None:
+                continue
+            frames.append(frame[..., ::-1])
+        return frames
+
+    def _frame_from_mss(self):
+        frames = []
+        with mss.mss() as sct:
+            mons = sct.monitors[1:]
+            idxs = self.monitor_indexes or list(range(len(mons)))
+            for i in idxs:
+                mon = mons[i]
+                img = np.array(sct.grab(mon))
+                frames.append(img[..., :3])
+        return frames
+
+    def _stack_frames(self, frames):
+        if not frames:
+            return None
+        max_h = max(f.shape[0] for f in frames)
+        padded = []
+        for f in frames:
+            h, w, c = f.shape
+            if h < max_h:
+                pad = np.zeros((max_h - h, w, 3), dtype=f.dtype)
+                f = np.vstack([f, pad])
+            padded.append(f)
+        return np.hstack(padded)
+
+    def _writer(self, size):
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self.last_clip_path = self.clips_dir / f"simian_{ts}.mp4"
+        self.clips_dir.mkdir(parents=True, exist_ok=True)
+        return cv2.VideoWriter(str(self.last_clip_path), fourcc, self.fps, size)
+
+    def _run(self):
+        use_dx = HAS_DXCAM
+        if not use_dx and not HAS_MSS:
+            return
+
+        if use_dx:
+            idxs, _ = self._get_monitors_dxcam()
+            frames = self._frame_from_dxcam(idxs)
+        else:
+            frames = self._frame_from_mss()
+        composite = self._stack_frames(frames)
+        if composite is None:
+            return
+        h, w = composite.shape[:2]
+        writer = self._writer((w, h))
+
+        frame_interval = 1.0 / self.fps
+        while not self._stop.is_set():
+            start = time.time()
+            if use_dx:
+                frames = self._frame_from_dxcam(idxs)
+            else:
+                frames = self._frame_from_mss()
+            composite = self._stack_frames(frames)
+            if composite is not None:
+                writer.write(composite)
+            dt = time.time() - start
+            if dt < frame_interval:
+                time.sleep(frame_interval - dt)
+        writer.release()
 
     def start(self):
-        if not IS_WIN:
-            raise RuntimeError("This ffmpeg recorder is currently Windows-only (gdigrab).")
-        with self._lock:
-            if self.proc and self.proc.poll() is None:
-                return self.filepath
-            self.filepath = self._next_filepath()
-            # Build ffmpeg command
-            # gdigrab captures whole desktop; -framerate first for gdigrab
-            # Use h264_nvenc if available, else libx264
-            video_codec = "libx264"
-            args = [
-                FFMPEG_PATH, "-y",
-                "-f", "gdigrab",
-                "-framerate", str(self.fps),
-                "-i", "desktop",
-                "-pix_fmt", "yuv420p",
-                "-vcodec", video_codec,
-                "-preset", "veryfast",
-                "-crf", str(23),
-                "-movflags", "+faststart",
-                str(self.filepath)
-            ]
-            creationflags = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW
-            self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
-            return self.filepath
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-    def stop(self)->Path | None:
-        with self._lock:
-            if not self.proc:
-                return None
-            try:
-                if IS_WIN:
-                    self.proc.send_signal(signal.CTRL_BREAK_EVENT if hasattr(signal, "CTRL_BREAK_EVENT") else signal.SIGTERM)
-                self.proc.terminate()
-            except Exception:
-                pass
-            finally:
-                self.proc.wait(timeout=5)
-                fp = self.filepath
-                self.proc = None
-                self.filepath = None
-                return fp
-
-RECORDER_SINGLETON: Recorder | None = None
-
-def start_recording()->str:
-    global RECORDER_SINGLETON
-    if not RECORDER_SINGLETON:
-        RECORDER_SINGLETON = Recorder()
-    path = RECORDER_SINGLETON.start()
-    return str(path)
-
-def stop_recording()->str | None:
-    global RECORDER_SINGLETON
-    if not RECORDER_SINGLETON:
-        return None
-    path = RECORDER_SINGLETON.stop()
-    return str(path) if path else None
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3.0)
+        return str(self.last_clip_path) if self.last_clip_path else None

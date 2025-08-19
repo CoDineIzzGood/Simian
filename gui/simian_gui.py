@@ -1,148 +1,151 @@
-# gui/simian_gui.py (delta version with Settings: voice + model + api base)
-from __future__ import annotations
-import os, threading, requests, json, tkinter as tk
-import customtkinter as ctk
+
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
 from pathlib import Path
+from typing import Optional
 
-APP_TITLE = "Simian"
-API_BASE_DEFAULT = "http://127.0.0.1:8000"
+from modules.llm_client import LLMClient
+from modules.screen_recorder import ScreenRecorder
+from utils.greetings import get_wakeup_message
 
-# --- small helpers ---
-def api_get(path:str):
+MONKEY_IMG_SIZE = 30  # px
+
+def _load_img(path: Path) -> Optional[tk.PhotoImage]:
     try:
-        r = requests.get(f"{state['api_base']}{path}", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-def api_post(path:str, payload:dict):
+        from PIL import Image, ImageTk  # type: ignore
+    except Exception:
+        return None
     try:
-        r = requests.post(f"{state['api_base']}{path}", json=payload, timeout=60)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+        img = Image.open(path).convert("RGBA").resize((MONKEY_IMG_SIZE, MONKEY_IMG_SIZE))
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        return None
 
-state = {
-    "model": os.environ.get("SIMIAN_MODEL","llama3.1"),
-    "api_base": os.environ.get("SIMIAN_API_BASE", API_BASE_DEFAULT),
-    "voice": os.environ.get("SIMIAN_VOICE","en-US-GuyNeural"),
-    "monitor_running": False,
-}
+def run(api_base: str):
+    root = tk.Tk()
+    root.title("Simian")
+    root.geometry("1200x700")
+    root.configure(bg="#111")
 
-class SimianGUI(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("1120x680")
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
-        # header with bigger monkey logo
-        hdr = ctk.CTkFrame(self)
-        hdr.pack(side="top", fill="x", padx=10, pady=(8,4))
-        self.logo = ctk.CTkLabel(hdr, text="🦧", font=ctk.CTkFont(size=28))   # bigger
-        self.logo.pack(side="left")
-        self.status = ctk.CTkLabel(hdr, text="Starting...", anchor="w")
-        self.status.pack(side="left", padx=8)
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("TNotebook", background="#111", borderwidth=0)
+    style.configure("TNotebook.Tab", background="#222", foreground="#ccc")
+    style.map("TNotebook.Tab", background=[("selected","#333")])
+    style.configure("TButton", background="#6a31ff", foreground="#fff", padding=8)
+    style.map("TButton", background=[("active","#7a4fff")])
 
-        # Tabs
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.pack(fill="both", expand=True, padx=10, pady=10)
-        self.tab_chat = self.tabs.add("Chat")
-        self.tab_clips = self.tabs.add("Clips")
-        self.tab_monitor = self.tabs.add("Screen Monitor")
-        self.tab_settings = self.tabs.add("Settings")
+    header = tk.Frame(root, bg="#111")
+    header.pack(fill="x", padx=10, pady=6)
+    assets_dir = Path(__file__).resolve().parent.parent / "assets"
+    monkey = _load_img(assets_dir / "monkey_idle.png")
+    if monkey:
+        tk.Label(header, image=monkey, bg="#111").pack(side="left", padx=(4,8))
+    tk.Label(header, text="Ready", fg="#ddd", bg="#111", font=("Segoe UI", 14, "bold")).pack(side="left")
 
-        # Chat area
-        self.text = tk.Text(self.tab_chat, bg="#222", fg="#ddd", insertbackground="#ddd", wrap="word")
-        self.text.pack(fill="both", expand=True, padx=8, pady=8)
-        entry_row = ctk.CTkFrame(self.tab_chat)
-        entry_row.pack(fill="x", padx=8, pady=(0,8))
-        self.entry = ctk.CTkEntry(entry_row)
-        self.entry.pack(side="left", fill="x", expand=True, padx=(0,8))
-        ctk.CTkButton(entry_row, text="Send", command=self.send).pack(side="left")
+    nb = ttk.Notebook(root)
+    nb.pack(fill="both", expand=True, padx=8, pady=6)
 
-        # Monitor controls
-        self.monitor_lbl = ctk.CTkLabel(self.tab_monitor, text="Monitor: stopped")
-        self.monitor_lbl.pack(pady=8)
-        btns = ctk.CTkFrame(self.tab_monitor); btns.pack(pady=6)
-        ctk.CTkButton(btns, text="Start Monitor", command=self.start_monitor).pack(side="left", padx=5)
-        ctk.CTkButton(btns, text="Stop Monitor", command=self.stop_monitor).pack(side="left", padx=5)
+    chat_tab = tk.Frame(nb, bg="#111")
+    nb.add(chat_tab, text="Chat")
 
-        # Settings
-        grid = ctk.CTkFrame(self.tab_settings); grid.pack(fill="x", padx=10, pady=10)
-        # model
-        ctk.CTkLabel(grid, text="Model (Ollama):").grid(row=0, column=0, sticky="w", padx=4, pady=6)
-        self.model_box = ctk.CTkComboBox(grid, values=["llama3.1","llama3","phi3","mistral"], command=self.on_model)
-        self.model_box.set(state["model"]); self.model_box.grid(row=0, column=1, sticky="ew", padx=4, pady=6)
-        # api base
-        ctk.CTkLabel(grid, text="API Base:").grid(row=1, column=0, sticky="w", padx=4, pady=6)
-        self.api_entry = ctk.CTkEntry(grid); self.api_entry.insert(0, state["api_base"])
-        self.api_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=6)
-        # voice
-        ctk.CTkLabel(grid, text="Voice:").grid(row=2, column=0, sticky="w", padx=4, pady=6)
-        voices = ["en-US-GuyNeural","en-US-JennyNeural","en-GB-RyanNeural","en-AU-NatashaNeural"]
-        self.voice_box = ctk.CTkComboBox(grid, values=voices, command=self.on_voice)
-        self.voice_box.set(state["voice"]); self.voice_box.grid(row=2, column=1, sticky="ew", padx=4, pady=6)
-        grid.grid_columnconfigure(1, weight=1)
-        ctk.CTkButton(self.tab_settings, text="Save", command=self.save_settings).pack(pady=(4,10))
+    txt = tk.Text(chat_tab, bg="#1a1a1a", fg="#ddd", insertbackground="#ddd", wrap="word")
+    txt.pack(fill="both", expand=True, padx=8, pady=8)
+    input_frame = tk.Frame(chat_tab, bg="#111")
+    input_frame.pack(fill="x", padx=8, pady=(0,8))
+    entry = tk.Entry(input_frame, bg="#1a1a1a", fg="#ddd", insertbackground="#ddd")
+    entry.pack(side="left", fill="x", expand=True, padx=(0,8))
+    send_btn = ttk.Button(input_frame, text="Send")
+    stop_rec_btn = ttk.Button(input_frame, text="Stop Rec")
+    send_btn.pack(side="left", padx=(0,8))
+    stop_rec_btn.pack(side="left")
 
-        self.after(100, self._post_init)
+    clips_tab = tk.Frame(nb, bg="#111")
+    nb.add(clips_tab, text="Clips")
+    clips_list = tk.Listbox(clips_tab, bg="#1a1a1a", fg="#ddd")
+    clips_list.pack(fill="both", expand=True, padx=8, pady=8)
 
-    # --- lifecycle ---
-    def _post_init(self):
-        # load greeting + set to status; autostart monitor for "privacy with a button"
-        hello = api_get("/hello")
-        if "greeting" in hello:
-            self.append(f"[{APP_TITLE}] {hello['greeting']}")
-        self.status.configure(text="Ready")
-        self.start_monitor()
+    mon_tab = tk.Frame(nb, bg="#111")
+    nb.add(mon_tab, text="Screen Monitor")
+    mon_status = tk.StringVar(value="Monitor running: 0s")
+    tk.Label(mon_tab, textvariable=mon_status, bg="#111", fg="#ddd").pack(pady=8)
+    start_mon_btn = ttk.Button(mon_tab, text="Start Monitor")
+    stop_mon_btn = ttk.Button(mon_tab, text="Stop Monitor")
+    start_mon_btn.pack(side="left", padx=8)
+    stop_mon_btn.pack(side="left", padx=8)
 
-    # --- chat ---
-    def append(self, msg:str):
-        self.text.insert("end", msg + "\n")
-        self.text.see("end")
+    settings_tab = tk.Frame(nb, bg="#111")
+    nb.add(settings_tab, text="Settings")
+    tk.Label(settings_tab, text="Model (Ollama):", fg="#ddd", bg="#111").pack(anchor="w", padx=8, pady=(10,2))
+    model_var = tk.StringVar(value=os.getenv("SIMIAN_MODEL","simian"))
+    model_entry = tk.Entry(settings_tab, textvariable=model_var, bg="#1a1a1a", fg="#ddd", insertbackground="#ddd")
+    model_entry.pack(fill="x", padx=8)
+    tk.Label(settings_tab, text="API Base:", fg="#ddd", bg="#111").pack(anchor="w", padx=8, pady=(10,2))
+    api_var = tk.StringVar(value=api_base)
+    api_entry = tk.Entry(settings_tab, textvariable=api_var, bg="#1a1a1a", fg="#ddd", insertbackground="#ddd")
+    api_entry.pack(fill="x", padx=8)
+    tk.Label(settings_tab, text="Voice (edge-tts):", fg="#ddd", bg="#111").pack(anchor="w", padx=8, pady=(10,2))
+    voice_var = tk.StringVar(value="en-US-AriaNeural")
+    voice_entry = tk.Entry(settings_tab, textvariable=voice_var, bg="#1a1a1a", fg="#ddd", insertbackground="#ddd")
+    voice_entry.pack(fill="x", padx=8)
 
-    def send(self):
-        prompt = self.entry.get().strip()
-        if not prompt: return
-        self.append(f"[You] {prompt}")
-        self.entry.delete(0, "end")
-        payload = {"prompt": prompt, "model": state["model"], "options": {}}
-        res = api_post("/api/chat", payload)
-        if isinstance(res, dict) and "error" in res:
-            self.append(f"[Error] {res['error']}")
-        else:
-            self.append(f"[{APP_TITLE}] {res}")
+    clips_dir = Path(__file__).resolve().parent.parent / "data" / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    client = LLMClient(api_var.get())
+    recorder = ScreenRecorder(str(clips_dir), fps=15, monitor_indexes=None)
 
-    # --- monitor ---
-    def start_monitor(self):
-        if state["monitor_running"]: return
-        api_get("/api/monitor/start")
-        state["monitor_running"] = True
-        self.monitor_lbl.configure(text="Monitor: running")
+    txt.insert("end", f"[Simian] {get_wakeup_message()}
+")
 
-    def stop_monitor(self):
-        if not state["monitor_running"]: return
-        api_get("/api/monitor/stop")
-        state["monitor_running"] = False
-        self.monitor_lbl.configure(text="Monitor: stopped")
+    def refresh_clips():
+        clips_list.delete(0, "end")
+        for p in sorted(clips_dir.glob("*.mp4")):
+            clips_list.insert("end", p.name)
 
-    # --- settings ---
-    def on_model(self, value): state["model"] = value
-    def on_voice(self, value): state["voice"] = value
+    def on_send():
+        user = entry.get().strip()
+        if not user:
+            return
+        txt.insert("end", f"[You] {user}\n")
+        entry.delete(0, "end")
+        try:
+            reply = client.chat(messages=[{"role":"user","content":user}], model=model_var.get())
+        except Exception as e:
+            messagebox.showerror("Chat error", str(e))
+            return
+        if isinstance(reply, (dict, list)):
+            reply = str(reply)
+        txt.insert("end", f"[Simian] {reply}\n")
+        txt.see("end")
 
-    def save_settings(self):
-        state["api_base"] = self.api_entry.get().strip() or API_BASE_DEFAULT
-        os.environ["SIMIAN_MODEL"] = state["model"]
-        os.environ["SIMIAN_VOICE"] = state["voice"]
-        os.environ["SIMIAN_API_BASE"] = state["api_base"]
-        self.append("[Simian] Settings saved.")
+    def on_stop_rec():
+        out = recorder.stop()
+        refresh_clips()
+        if out:
+            messagebox.showinfo("Recorder", f"Saved: {out}")
 
-def launch_gui():
-    app = SimianGUI()
-    app.mainloop()
+    def on_start_mon():
+        recorder.start()
+        start = [int(__import__("time").time())]
+        def tick():
+            if recorder._thread and recorder._thread.is_alive():
+                sec = int(__import__("time").time()) - start[0]
+                mon_status.set(f"Monitor running: {sec}s")
+                root.after(1000, tick)
+        tick()
 
-if __name__ == "__main__":
-    launch_gui()
+    def on_stop_mon():
+        recorder.stop()
+        refresh_clips()
+
+    send_btn.configure(command=on_send)
+    stop_rec_btn.configure(command=on_stop_rec)
+    start_mon_btn.configure(command=on_start_mon)
+    stop_mon_btn.configure(command=on_stop_mon)
+
+    recorder.start()
+    root.after(500, refresh_clips)
+
+    root.mainloop()
