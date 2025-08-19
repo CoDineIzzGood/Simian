@@ -9,3 +9,8 @@ venv/
 *.mp4
 *.wav
 *.png
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc

@@ -1,88 +1,87 @@
-
 # modules/screen_recorder.py
-import os
-import threading
-import time
-from datetime import datetime
+"""
+Screen recorder using ffmpeg (gdigrab on Windows). No mss, no thread-local errors.
+Writes MP4 clips into data/clips/. Auto-rotates files by timestamp.
+"""
+from __future__ import annotations
+import os, subprocess, datetime, threading, shlex, sys, signal
 from pathlib import Path
 
-import mss
-import numpy as np
+IS_WIN = os.name == "nt"
+FFMPEG_PATH = os.path.join(os.path.dirname(__file__), "..", "ffmpeg-7.1.1", "bin", "ffmpeg.exe") if IS_WIN else "ffmpeg"
 
-try:
-    import cv2
-except Exception as e:
-    raise RuntimeError("OpenCV (cv2) is required for screen recording. pip install opencv-python") from e
-
-CLIPS_DIR = Path("data/clips")
+CLIPS_DIR = Path(__file__).resolve().parents[1] / "data" / "clips"
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
-class ScreenRecorder:
-    def __init__(self, fps: int = 20, region: dict | None = None, filename_prefix: str = "simian"):
+class Recorder:
+    def __init__(self, fps:int=30, q:int=25, monitor:str="desktop"):
         self.fps = fps
-        self.region = region  # e.g., {"top":0,"left":0,"width":1920,"height":1080}
-        self.filename_prefix = filename_prefix
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._out = None
-        self._path: Path | None = None
+        self.q = q
+        self.monitor = monitor
+        self.proc: subprocess.Popen | None = None
+        self.filepath: Path | None = None
+        self._lock = threading.Lock()
 
-    def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+    def _next_filepath(self)->Path:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return CLIPS_DIR / f"simian_{ts}.mp4"
 
-    def start(self) -> Path:
-        if self.is_running():
-            return self._path  # already running
+    def start(self):
+        if not IS_WIN:
+            raise RuntimeError("This ffmpeg recorder is currently Windows-only (gdigrab).")
+        with self._lock:
+            if self.proc and self.proc.poll() is None:
+                return self.filepath
+            self.filepath = self._next_filepath()
+            # Build ffmpeg command
+            # gdigrab captures whole desktop; -framerate first for gdigrab
+            # Use h264_nvenc if available, else libx264
+            video_codec = "libx264"
+            args = [
+                FFMPEG_PATH, "-y",
+                "-f", "gdigrab",
+                "-framerate", str(self.fps),
+                "-i", "desktop",
+                "-pix_fmt", "yuv420p",
+                "-vcodec", video_codec,
+                "-preset", "veryfast",
+                "-crf", str(23),
+                "-movflags", "+faststart",
+                str(self.filepath)
+            ]
+            creationflags = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW
+            self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+            return self.filepath
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = CLIPS_DIR / f"{self.filename_prefix}_{ts}.mp4"
+    def stop(self)->Path | None:
+        with self._lock:
+            if not self.proc:
+                return None
+            try:
+                if IS_WIN:
+                    self.proc.send_signal(signal.CTRL_BREAK_EVENT if hasattr(signal, "CTRL_BREAK_EVENT") else signal.SIGTERM)
+                self.proc.terminate()
+            except Exception:
+                pass
+            finally:
+                self.proc.wait(timeout=5)
+                fp = self.filepath
+                self.proc = None
+                self.filepath = None
+                return fp
 
-        # Prepare capture
-        sct = mss.mss()
-        mon = self.region or sct.monitors[1]  # primary monitor
-        width, height = mon["width"], mon["height"]
+RECORDER_SINGLETON: Recorder | None = None
 
-        # FourCC for .mp4
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(str(out_path), fourcc, self.fps, (width, height))
+def start_recording()->str:
+    global RECORDER_SINGLETON
+    if not RECORDER_SINGLETON:
+        RECORDER_SINGLETON = Recorder()
+    path = RECORDER_SINGLETON.start()
+    return str(path)
 
-        if not out.isOpened():
-            raise RuntimeError("Failed to open VideoWriter. Ensure opencv is installed and you have write permission.")
-
-        self._out = out
-        self._path = out_path
-        self._stop.clear()
-
-        def _run():
-            frame_interval = 1.0 / max(self.fps, 1)
-            with sct:
-                last = 0.0
-                while not self._stop.is_set():
-                    start = time.perf_counter()
-                    img = np.array(sct.grab(mon))  # RGBA
-                    frame = img[..., :3]  # BGR expected after conversion below
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    self._out.write(frame)
-                    # sleep to keep fps
-                    elapsed = time.perf_counter() - start
-                    rem = frame_interval - elapsed
-                    if rem > 0:
-                        time.sleep(rem)
-
-            # Finalize properly
-            self._out.release()
-            self._out = None
-
-        self._thread = threading.Thread(target=_run, daemon=True)
-        self._thread.start()
-        return out_path
-
-    def stop(self) -> Path | None:
-        if not self.is_running():
-            return self._path
-        self._stop.set()
-        self._thread.join(timeout=5)
-        self._thread = None
-        p = self._path
-        self._path = None
-        return p
+def stop_recording()->str | None:
+    global RECORDER_SINGLETON
+    if not RECORDER_SINGLETON:
+        return None
+    path = RECORDER_SINGLETON.stop()
+    return str(path) if path else None
