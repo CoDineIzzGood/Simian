@@ -1,0 +1,10 @@
+# SimianModelfile
+FROM llama3
+TEMPLATE """
+{{ if .System }}
+{{ .System }}
+{{ end }}
+User: {{ .Prompt }}
+Assistant:
+"""
+PARAMETER temperature 0.7

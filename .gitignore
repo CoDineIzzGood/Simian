@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs and crash output
+logs/
+crash_logs/
+*.log
+
+# Local databases / runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment / secrets
+.env
+.env.*
+
+# Media / generated runtime output
+data/images/
+data/frames/
+data/clips/
+data/recordings/
+data/screenshots/
+*.avi
+*.mp4
+*.wav
+
+# Large local speech/model assets
+voice/vosk-model-*/
+ffmpeg-*.tar.xz
+
+# Local model artifacts
+models/**/*.gguf
+models/**/*.bin
+models/**/*.safetensors
+models/**/*.onnx
+models/**/*.pt
+models/**/*.pth
+
+# Local Ollama / model-cache style folders if you create them
+ollama_models/
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

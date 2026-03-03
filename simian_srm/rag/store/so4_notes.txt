@@ -1,0 +1,2 @@
+SO(4) rotations decompose into two independent plane rotations. Tesseract: 16 vertices, edges connect vertices differing in one coordinate.
+Perspective 4D->3D uses w-camera distance; keep edge length invariants for stability.

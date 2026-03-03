@@ -1,0 +1,21 @@
+
+from .predict_utils import predict_with_model
+
+def auto_select_and_predict(input_data: dict):
+    model_scores = {}
+    results = {}
+
+    # You can prioritize based on heuristics, speed, past accuracy, etc.
+    preferred_order = ["tuned", "xgboost", "lightgbm", "gradient_boost"]
+
+    for model_name in preferred_order:
+        result = predict_with_model(model_name, input_data)
+        if "error" not in result:
+            return result  # Use first successful prediction
+        else:
+            results[model_name] = result["error"]
+
+    return {
+        "error": "All models failed.",
+        "details": results
+    }

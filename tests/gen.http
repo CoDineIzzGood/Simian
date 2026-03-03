@@ -1,0 +1,8 @@
+POST http://127.0.0.1:8000/gen/txt2img
+Content-Type: application/json
+
+{
+  "prompt": "retro neon cyberpunk chimp logo, 3D render",
+  "steps": 24,
+  "guidance_scale": 7.5
+}

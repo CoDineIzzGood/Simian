@@ -1,0 +1,72 @@
+
+--- CRASH @ 2025-08-05 15:43:54 ---
+Traceback (most recent call last):
+  File "gui\simian_gui.py", line 23, in <module>
+    from vosk import Model, KaldiRecognizer
+  File "<frozen importlib._bootstrap>", line 1178, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1149, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 690, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "vosk\__init__.py", line 36, in <module>
+  File "vosk\__init__.py", line 27, in open_dll
+  File "<frozen os>", line 1118, in add_dll_directory
+FileNotFoundError: [WinError 2] The system cannot find the file specified: 'C:\\Users\\ALEXAN~1\\AppData\\Local\\Temp\\_MEI44962\\vosk'
+
+
+--- CRASH @ 2025-08-05 16:03:41 ---
+Traceback (most recent call last):
+  File "gui\simian_gui.py", line 23, in <module>
+    from vosk import Model, KaldiRecognizer
+  File "<frozen importlib._bootstrap>", line 1178, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1149, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 690, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "vosk\__init__.py", line 36, in <module>
+  File "vosk\__init__.py", line 27, in open_dll
+  File "<frozen os>", line 1118, in add_dll_directory
+FileNotFoundError: [WinError 2] The system cannot find the file specified: 'C:\\Users\\ALEXAN~1\\AppData\\Local\\Temp\\_MEI171522\\vosk'
+
+
+--- CRASH @ 2025-08-05 16:47:15 ---
+Traceback (most recent call last):
+  File "gui\simian_gui.py", line 23, in <module>
+    from vosk import Model, KaldiRecognizer
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "vosk\__init__.py", line 36, in <module>
+  File "vosk\__init__.py", line 27, in open_dll
+  File "os.py", line 1118, in add_dll_directory
+FileNotFoundError: [WinError 2] The system cannot find the file specified: 'C:\\Users\\Alexander Munson\\OneDrive\\Desktop\\Project C.H.I.M.P\\Simian\\dist\\Simian\\_internal\\vosk'
+
+
+--- CRASH @ 2025-08-06 01:08:10 ---
+Traceback (most recent call last):
+  File "gui\simian_gui.py", line 21, in <module>
+    from screen_recorder import start_recording
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "screen_recorder.py", line 4, in <module>
+    import pyautogui
+ModuleNotFoundError: No module named 'pyautogui'
+
+
+--- CRASH @ 2025-08-06 01:33:31 ---
+Traceback (most recent call last):
+  File "gui\simian_gui.py", line 21, in <module>
+    from screen_recorder import start_recording
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "screen_recorder.py", line 34, in <module>
+    from PyQt5.QtWidgets import QApplication, QWidget, QPushButton
+ModuleNotFoundError: No module named 'PyQt5'
+
+
+--- CRASH @ 2025-08-06 11:57:32 ---
+Traceback (most recent call last):
+  File "gui\simian_gui.py", line 21, in <module>
+    from screen_recorder import start_recording
+  File "PyInstaller\loader\pyimod02_importers.py", line 457, in exec_module
+  File "screen_recorder.py", line 34, in <module>
+    from PyQt5.QtWidgets import QApplication, QWidget, QPushButton
+ModuleNotFoundError: No module named 'PyQt5'
+

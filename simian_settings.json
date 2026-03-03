@@ -1,0 +1,12 @@
+{
+  "api_host": "127.0.0.1",
+  "api_port": 8000,
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "simian",
+  "tts_enabled": true,
+  "tts_voice": "en-US-GuyNeural",
+  "auto_start_api": true,
+  "auto_start_voice": true,
+  "clips_folder": "data/clips",
+  "clip_log": "data/clip_log.json"
+}

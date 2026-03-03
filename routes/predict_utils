@@ -1,0 +1,30 @@
+
+import joblib
+import os
+import pandas as pd
+
+# List of supported models and their filenames
+MODEL_PATHS = {
+    "xgboost": "ml_models/models/xgboost_model.joblib",
+    "lightgbm": "ml_models/models/lightgbm_model.joblib",
+    "gradient_boost": "ml_models/models/gradient_boost_model.joblib",
+    "distributed": "ml_models/models/distributed_model.joblib",
+    "transfer": "ml_models/models/transfer_model.joblib",
+    "tuned": "ml_models/models/tuned_model.joblib",
+}
+
+def load_model(model_name):
+    model_file = MODEL_PATHS.get(model_name)
+    if model_file and os.path.exists(model_file):
+        return joblib.load(model_file)
+    else:
+        raise FileNotFoundError(f"Model '{model_name}' not found at path {model_file}")
+
+def predict_with_model(model_name, input_data: dict):
+    try:
+        model = load_model(model_name)
+        df = pd.DataFrame([input_data])
+        prediction = model.predict(df)[0]
+        return {"model": model_name, "prediction": prediction}
+    except Exception as e:
+        return {"error": str(e), "model": model_name}
