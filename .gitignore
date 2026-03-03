@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *.pyo
+<<<<<<< HEAD
+=======
+*.pyd
+>>>>>>> 1d527cd0 (Update .gitignore)
 
 # Virtual environments
 venv/
@@ -13,7 +17,11 @@ build/
 dist/
 *.egg-info/
 
+<<<<<<< HEAD
 # Logs and crash output
+=======
+# Logs / crash output
+>>>>>>> 1d527cd0 (Update .gitignore)
 logs/
 crash_logs/
 *.log
@@ -26,20 +34,43 @@ crash_logs/
 # Environment / secrets
 .env
 .env.*
+<<<<<<< HEAD
 
 # Media / generated runtime output
+=======
+*.key
+*.pem
+
+# Generated runtime data
+>>>>>>> 1d527cd0 (Update .gitignore)
 data/images/
 data/frames/
 data/clips/
 data/recordings/
 data/screenshots/
+<<<<<<< HEAD
+=======
+data/telemetry/
+data/generated/
+data/clip_log.json
+
+# Media output
+>>>>>>> 1d527cd0 (Update .gitignore)
 *.avi
 *.mp4
 *.wav
 
+<<<<<<< HEAD
 # Large local speech/model assets
 voice/vosk-model-*/
 ffmpeg-*.tar.xz
+=======
+# Large local speech/model/vendor assets
+voice/vosk-model-*/
+ffmpeg-*.tar.xz
+ffmpeg-7.1.1/
+*.whl
+>>>>>>> 1d527cd0 (Update .gitignore)
 
 # Local model artifacts
 models/**/*.gguf
@@ -48,12 +79,48 @@ models/**/*.safetensors
 models/**/*.onnx
 models/**/*.pt
 models/**/*.pth
+<<<<<<< HEAD
 
 # Local Ollama / model-cache style folders if you create them
+=======
+>>>>>>> 1d527cd0 (Update .gitignore)
 ollama_models/
 
 # Editor / OS clutter
 .vscode/
 .idea/
 .DS_Store
+<<<<<<< HEAD
 Thumbs.db
+=======
+Thumbs.db
+desktop.ini
+
+# virtual envs
+venv/
+.venv/
+env/
+
+# build artifacts
+build/
+dist/
+
+# local databases
+*.db
+data/*.db
+
+# editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# test/cache
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# local secrets
+.env
+.env.*
+>>>>>>> 1d527cd0 (Update .gitignore)
