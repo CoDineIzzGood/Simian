@@ -155,4 +155,5 @@ _mount_router("routes.srm_route", "", "srm")
 _mount_router("routes.news", "/api", "news")
 _mount_router("routes.files", "/api", "files")
 _mount_router("routes.telemetry", "/api", "telemetry")
+_mount_router("routes.model_router", "/api/models", "model-router")
 

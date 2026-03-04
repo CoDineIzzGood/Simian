@@ -1,83 +1,37 @@
-"""
-Central settings store for Simian.
-
-- Persists user preferences to data/settings.json
-- Safe defaults if file missing/corrupt
-- No GUI imports (keeps it usable by backend/services)
-"""
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+import json
+from typing import Dict, Any
 
-DEFAULT_SETTINGS_PATH = Path("data") / "settings.json"
-
-
-@dataclass
-class Settings:
-    # UI
-    theme: str = "dark"
-    accent_hex: str = "#1f6feb"  # used by GUI for accent elements
-
-    # Voice / TTS
-    voice_enabled: bool = True
-    tts_engine: str = "edge"  # "edge" or "pyttsx3"
-    voice_id: str = "en-US-GuyNeural"
-    voice_rate: str = "+0%"  # Edge-TTS format
-
-    # Replay buffer / clips
-    clips_dir: str = r"D:\Project_C.H.I.M.P\Simian\data\clips"
-    buffer_dir: str = r"D:\Project_C.H.I.M.P\Simian\data\buffer"
-    replay_minutes: int = 5
-    segment_seconds: int = 10
-    fps: int = 60
-    width: int = 1280
-    height: int = 720
-    export_upscale: str = "none"  # "none" | "1080p" | "4k"
-    extra_seconds_default: int = 0
-
-    # News
-    news_refresh_seconds: int = 300
-    news_default_category: str = "tech"
+SETTINGS_PATH = Path("config/settings.json")
+DEFAULT_SETTINGS: Dict[str, Any] = {
+    "router": {
+        "chat": "qwen3.5:9b",
+        "vision": "qwen3-vl:8b-thinking",
+        "code": "qwen2.5-coder:7b",
+        "reasoning": "qwen3-vl:8b-thinking",
+        "translate": "translategemma:4b",
+        "embedding": "embeddinggemma:300m",
+        "fallback": "qwen3.5:9b",
+    }
+}
 
 
-def _coerce_int(v: Any, fallback: int) -> int:
+def _ensure_parent() -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_settings() -> Dict[str, Any]:
+    if not SETTINGS_PATH.exists():
+        return DEFAULT_SETTINGS.copy()
+
     try:
-        return int(v)
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return fallback
+        return DEFAULT_SETTINGS.copy()
 
 
-def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
-    try:
-        if not path.exists():
-            return Settings()
-        data = json.loads(path.read_text(encoding="utf-8"))
-        s = Settings()
-        for k, v in data.items():
-            if not hasattr(s, k):
-                continue
-            # coerce some numeric fields
-            if k in ("replay_minutes", "segment_seconds", "fps", "width", "height", "news_refresh_seconds", "extra_seconds_default"):
-                v = _coerce_int(v, getattr(s, k))
-            setattr(s, k, v)
-        return s
-    except Exception:
-        # corrupt config -> defaults
-        return Settings()
-
-
-def save_settings(settings: Settings, path: Path = DEFAULT_SETTINGS_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
-
-
-def patch_settings(patch: Dict[str, Any], path: Path = DEFAULT_SETTINGS_PATH) -> Settings:
-    s = load_settings(path)
-    for k, v in patch.items():
-        if hasattr(s, k):
-            setattr(s, k, v)
-    save_settings(s, path)
-    return s
+def save_settings(data: Dict[str, Any]) -> None:
+    _ensure_parent()
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
