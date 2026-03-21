@@ -35,7 +35,7 @@ def _probe_ollama() -> tuple[bool, str | None]:
     except requests.exceptions.RequestException as exc:
         return False, str(exc)
 
-def chat_reply(message: str, session_id: str | None = None) -> str:
+def chat_reply(message: str, model: str | None = None, session_id: str | None = None) -> str:
     try:
         available, hint = _probe_ollama()
         if not available:

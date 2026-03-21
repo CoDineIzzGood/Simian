@@ -1,7 +1,7 @@
 import os
 import sys
 import ipaddress
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +39,8 @@ def _parse_networks(raw: str) -> List[ipaddress._BaseNetwork]:
 ALLOWED_ORIGINS = _expand_origins(ALLOWED_ORIGINS_RAW)
 ALLOW_NETS = _parse_networks(ALLOW_NETS_RAW)
 
+from routes.chat import chat_reply
+from services.model_router import ModelRouterService
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 # ---------- CORS ----------
@@ -113,10 +115,15 @@ async def api_meta():
     return await meta()
 
 class ChatIn(BaseModel):
-    text: str
+    # Backwards/forwards compatible input
+    text: Optional[str] = None
+    message: Optional[str] = None
+    messages: Optional[List[Dict[str, Any]]] = None
+    model: Optional[str] = None
 
 class ChatOut(BaseModel):
     reply: str
+    model: Optional[str] = None
 
 @app.post("/api/chat", response_model=ChatOut, dependencies=[Depends(api_key_guard)])
 async def api_chat(body: ChatIn):
@@ -156,4 +163,3 @@ _mount_router("routes.news", "/api", "news")
 _mount_router("routes.files", "/api", "files")
 _mount_router("routes.telemetry", "/api", "telemetry")
 _mount_router("routes.model_router", "/api/models", "model-router")
-

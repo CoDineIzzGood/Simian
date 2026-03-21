@@ -1,94 +1,111 @@
 """
 Offline mic listener (background voice commands) using Vosk + sounddevice.
-
-Commands supported (customizable later):
-- "clip that"                      -> export last replay buffer window
-- "clip that plus <N> seconds"      -> export last window + extra seconds
-- "start buffer" / "stop buffer"    -> controls replay buffer recorder
-- "start recording" / "stop recording" -> for one-off recorder (not implemented here)
-
-This module is intentionally dependency-soft:
-- If vosk/sounddevice are missing, MicListenerService reports unavailable instead of crashing.
-
-Bundling notes (PyInstaller):
-- include the Vosk model folder under dist (see your spec file)
+Supports wake-word background listening and optional hot-mic chat dictation.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Dict, Any
-
-from services.settings_store import load_settings
+from typing import Any, Callable, Dict, Optional
 
 try:
     import sounddevice as sd  # type: ignore
-    from vosk import Model, KaldiRecognizer  # type: ignore
+    from vosk import KaldiRecognizer, Model  # type: ignore
 except Exception:  # pragma: no cover
     sd = None
     Model = None
     KaldiRecognizer = None
 
-
 CommandCallback = Callable[[str, Dict[str, Any]], None]
+TranscriptCallback = Callable[[str, Dict[str, Any]], None]
+
+COMMAND_PATTERNS = {
+    "clip": re.compile(r"\bclip that\b", re.IGNORECASE),
+    "buffer_start": re.compile(r"\b(start buffer|start replay)\b", re.IGNORECASE),
+    "buffer_stop": re.compile(r"\b(stop buffer|stop replay)\b", re.IGNORECASE),
+}
+IGNORE_UTTERANCES = {"huh", "uh", "um", "hmm", "hm", "mm"}
 
 
 def _find_vosk_model_dir() -> Optional[Path]:
-    # User can override
     env = os.environ.get("VOSK_MODEL_DIR")
     if env and Path(env).exists():
         return Path(env)
 
-    # Typical locations in your project
     candidates = [
         Path("models") / "vosk-model-small-en-us-0.15",
         Path("models") / "vosk-model-en-us-0.22",
+        Path("voice") / "vosk-model-small-en-us-0.15",
+        Path("voice") / "vosk-model-en-us-0.22",
         Path("vosk-model-small-en-us-0.15"),
         Path("vosk-model-en-us-0.22"),
     ]
-    for c in candidates:
-        if c.exists():
-            return c
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
 
-    # PyInstaller _MEIPASS
     meipass = os.environ.get("_MEIPASS")
     if meipass:
         base = Path(meipass)
-        for c in base.rglob("vosk-model*"):
-            if c.is_dir():
-                return c
+        for candidate in base.rglob("vosk-model*"):
+            if candidate.is_dir():
+                return candidate
     return None
 
 
 @dataclass
 class MicListenerConfig:
     samplerate: int = 16000
-    device: Optional[int] = None  # sounddevice device index
-    wake_word: str = "simian"     # optional wake word; if empty -> hot commands always on
+    device: Optional[int] = None
+    wake_word: str = "simian"
 
 
 class MicListenerService:
-    def __init__(self, log_cb=None, command_cb: Optional[CommandCallback] = None, config: Optional[MicListenerConfig] = None):
-        self.log = log_cb or (lambda msg: None)
-        self.command_cb = command_cb or (lambda cmd, meta: None)
+    def __init__(
+        self,
+        log_cb: Optional[Callable[[str], None]] = None,
+        command_cb: Optional[CommandCallback] = None,
+        transcript_cb: Optional[TranscriptCallback] = None,
+        config: Optional[MicListenerConfig] = None,
+    ):
+        self.log = log_cb or (lambda _msg: None)
+        self.command_cb = command_cb or (lambda _cmd, _meta: None)
+        self.transcript_cb = transcript_cb or (lambda _text, _meta: None)
         self.config = config or MicListenerConfig()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-
         self._available = sd is not None and Model is not None and KaldiRecognizer is not None
+        self.hot_mode = False
+        self._last_text = ""
+        self._last_text_ts = 0.0
 
     def available(self) -> bool:
         return self._available and (_find_vosk_model_dir() is not None)
 
+    def unavailable_reason(self) -> str:
+        if sd is None or Model is None or KaldiRecognizer is None:
+            return "Mic listener unavailable: install both 'vosk' and 'sounddevice'."
+        if _find_vosk_model_dir() is None:
+            return "Mic listener unavailable: set VOSK_MODEL_DIR or add a Vosk model folder under ./models or ./voice."
+        return "Mic listener unavailable."
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
+
+    def set_hot_mode(self, enabled: bool) -> None:
+        self.hot_mode = bool(enabled)
+        self.log(f"[Voice] Listener mode: {'hot mic' if self.hot_mode else 'wake word'}.")
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.is_running():
             return
         if not self.available():
-            self.log("[Voice] Mic listener unavailable (install vosk + sounddevice, and provide a Vosk model folder).")
+            self.log(f"[Voice] {self.unavailable_reason()}")
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="MicListenerService", daemon=True)
@@ -97,66 +114,116 @@ class MicListenerService:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
         self.log("[Voice] Mic listener stopped.")
 
     def _run(self) -> None:
+        if sd is None or Model is None or KaldiRecognizer is None:
+            self.log("[Voice] Listener dependencies are unavailable.")
+            return
+
         model_dir = _find_vosk_model_dir()
         if not model_dir:
             self.log("[Voice] No Vosk model directory found.")
             return
 
-        model = Model(str(model_dir))
-        rec = KaldiRecognizer(model, self.config.samplerate)
-        rec.SetWords(False)
+        try:
+            model = Model(str(model_dir))
+            rec = KaldiRecognizer(model, self.config.samplerate)
+            rec.SetWords(False)
+        except Exception as e:
+            self.log(f"[Voice] Failed to initialize Vosk model: {e}")
+            return
 
-        def callback(indata, frames, time_info, status):  # pragma: no cover
+        def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             if self._stop.is_set():
-                raise sd.CallbackStop()
+                callback_stop = getattr(sd, "CallbackStop", None)
+                if callback_stop is not None:
+                    raise callback_stop()
+                return
             if status:
-                # don't spam logs
-                pass
-            data = indata.tobytes()
+                return
+
+            try:
+                data = bytes(indata)
+            except Exception:
+                try:
+                    data = memoryview(indata).tobytes()
+                except Exception:
+                    return
+
             if rec.AcceptWaveform(data):
                 try:
-                    import json
-                    j = json.loads(rec.Result())
-                    text = (j.get("text") or "").strip().lower()
+                    result = json.loads(rec.Result())
+                    text = str(result.get("text") or "").strip().lower()
                     if text:
                         self._handle_text(text)
                 except Exception:
-                    pass
+                    return
 
-        with sd.RawInputStream(samplerate=self.config.samplerate, blocksize=8000, dtype="int16",
-                               channels=1, callback=callback, device=self.config.device):
-            while not self._stop.is_set():
-                time.sleep(0.1)
+        raw_stream = getattr(sd, "RawInputStream", None)
+        if raw_stream is None:
+            self.log("[Voice] sounddevice.RawInputStream is unavailable.")
+            return
+
+        try:
+            with raw_stream(
+                samplerate=self.config.samplerate,
+                blocksize=8000,
+                dtype="int16",
+                channels=1,
+                callback=callback,
+                device=self.config.device,
+            ):
+                while not self._stop.is_set():
+                    time.sleep(0.1)
+        except Exception as e:
+            self.log(f"[Voice] Mic stream failed: {e}")
+
+    def _extract_after_wake(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+        if self.hot_mode:
+            return cleaned
+        wake = (self.config.wake_word or "").strip().lower()
+        if not wake:
+            return cleaned
+        if wake not in cleaned:
+            return ""
+        parts = cleaned.split(wake, 1)
+        return parts[1].strip(" ,.!?-")
+
+    def _is_duplicate(self, text: str) -> bool:
+        now = time.time()
+        if text == self._last_text and (now - self._last_text_ts) < 2.0:
+            return True
+        self._last_text = text
+        self._last_text_ts = now
+        return False
 
     def _handle_text(self, text: str) -> None:
-        # Optional wake word gating
-        wake = (self.config.wake_word or "").strip().lower()
-        if wake:
-            if wake not in text:
+        heard = (text or "").strip().lower()
+        if not heard or heard in IGNORE_UTTERANCES:
+            return
+        if self._is_duplicate(heard):
+            return
+
+        self.log(f"[Voice] Heard: {heard}")
+
+        for name, pattern in COMMAND_PATTERNS.items():
+            if pattern.search(heard):
+                meta: Dict[str, Any] = {"raw": heard}
+                if name == "clip":
+                    match = re.search(r"(?:plus|extra)\s+(\d+)\s*(seconds|second|sec|s)?", heard)
+                    if match:
+                        meta["extra_seconds"] = int(match.group(1))
+                self.command_cb(name, meta)
                 return
-            # remove wake word
-            text = text.replace(wake, "").strip()
 
-        # Parse commands
-        cmd = None
-        meta: Dict[str, Any] = {"raw": text}
-
-        if "clip that" in text:
-            cmd = "clip"
-            # parse optional extra seconds
-            m = re.search(r"(?:plus|extra)\s+(\d+)\s*(seconds|second|sec|s)?", text)
-            if m:
-                meta["extra_seconds"] = int(m.group(1))
-        elif "start buffer" in text or "start replay" in text:
-            cmd = "buffer_start"
-        elif "stop buffer" in text or "stop replay" in text:
-            cmd = "buffer_stop"
-
-        if cmd:
-            self.log(f"[Voice] Command: {cmd} ({text})")
-            self.command_cb(cmd, meta)
+        spoken = self._extract_after_wake(heard)
+        if not spoken or spoken in IGNORE_UTTERANCES or len(spoken) < 2:
+            return
+        self.transcript_cb(spoken, {"raw": heard, "hot_mode": self.hot_mode})
