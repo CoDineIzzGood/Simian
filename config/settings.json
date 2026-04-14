@@ -29,12 +29,14 @@
   "news_search_limit": 60,
   "stt_input_device": "default",
   "tts_output_device": "default",
-  "replay_system_audio_device": "",
+  "replay_system_audio_device": "__DEFAULT_WASAPI__",
   "replay_mic_device": "",
   "auto_start_ollama": true,
   "auto_start_mic": true,
   "auto_start_replay": false,
   "warm_backends_on_launch": true,
   "safe_startup_delay_ms": 1500,
+  "phrase_end_silence_sec": 1.15,
+  "stt_min_words": 2,
   "ollama_start_timeout": 8
 }

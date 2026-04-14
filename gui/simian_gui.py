@@ -98,60 +98,68 @@ HEALTH_QUERY_RE = re.compile(
 
 
 class UILogger:
-    def __init__(self, root: ctk.CTk, textbox: ctk.CTkTextbox, max_lines: int = 1200):
+    def __init__(self, root: ctk.CTk, textbox: ctk.CTkTextbox, max_lines: int = 800, poll_ms: int = 120, batch_size: int = 80):
         self.root = root
         self.textbox = textbox
         self.max_lines = max_lines
-        self._queue: queue.Queue[str] = queue.Queue()
+        self.poll_ms = max(50, int(poll_ms))
+        self.batch_size = max(10, int(batch_size))
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._scheduled = False
         self._line_count = 0
-        self._drain_scheduled = False
+        self._schedule_drain()
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         self._queue.put(f"[{ts}] {msg}\n")
-        if not self._drain_scheduled:
-            self._drain_scheduled = True
-            try:
-                self.root.after(50, self._drain)
-            except Exception:
-                self._drain_scheduled = False
+        self._schedule_drain()
+
+    def _schedule_drain(self) -> None:
+        if self._scheduled:
+            return
+        self._scheduled = True
+        try:
+            self.root.after(self.poll_ms, self._drain)
+        except Exception:
+            self._scheduled = False
 
     def _drain(self) -> None:
-        self._drain_scheduled = False
-        try:
-            batch: list[str] = []
-            while True:
-                batch.append(self._queue.get_nowait())
-        except queue.Empty:
-            pass
-
-        if not batch:
+        self._scheduled = False
+        if not self.textbox.winfo_exists():
             return
 
-        try:
+        items: list[str] = []
+        for _ in range(self.batch_size):
+            try:
+                items.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+
+        if items:
+            joined = "".join(items)
+            new_lines = joined.count("\n")
             self.textbox.configure(state="normal")
-            self.textbox.insert("end", "".join(batch))
-            self._line_count += sum(item.count("\n") for item in batch)
+            self.textbox.insert("end", joined)
+            self._line_count += new_lines
             if self._line_count > self.max_lines:
                 try:
-                    content = self.textbox.get("1.0", "end-1c")
-                    lines = content.splitlines()
-                    trimmed = lines[-self.max_lines:]
-                    self.textbox.delete("1.0", "end")
-                    self.textbox.insert("end", "\n".join(trimmed) + ("\n" if trimmed else ""))
-                    self._line_count = len(trimmed)
+                    start_line = max(1, self._line_count - self.max_lines + 1)
+                    self.textbox.delete("1.0", f"{start_line}.0")
+                    self._line_count = self.max_lines
                 except Exception:
-                    pass
+                    try:
+                        content = self.textbox.get("1.0", "end-1c")
+                        lines = content.splitlines()
+                        trimmed = lines[-self.max_lines:]
+                        self.textbox.delete("1.0", "end")
+                        self.textbox.insert("end", "\n".join(trimmed) + ("\n" if trimmed else ""))
+                        self._line_count = len(trimmed)
+                    except Exception:
+                        pass
             self.textbox.see("end")
             self.textbox.configure(state="disabled")
-        finally:
-            if not self._queue.empty() and not self._drain_scheduled:
-                self._drain_scheduled = True
-                try:
-                    self.root.after(50, self._drain)
-                except Exception:
-                    self._drain_scheduled = False
 
+        self._schedule_drain()
 
 def port_in_use(host: str, port: int) -> bool:
     try:
@@ -212,7 +220,8 @@ class SimianApp(ctk.CTk):
         self.log_box = ctk.CTkTextbox(self.tab_logs, wrap="word")
         self.log_box.pack(fill="both", expand=True, padx=10, pady=10)
         self.log_box.configure(state="disabled")
-        self.log = UILogger(self, self.log_box).log
+        self._ui_logger = UILogger(self, self.log_box, max_lines=700, poll_ms=140, batch_size=100)
+        self.log = self._ui_logger.log
         self.log("GUI ready.")
 
         # Services / state
@@ -237,26 +246,9 @@ class SimianApp(ctk.CTk):
         self._apply_accent_color()
 
         # Auto-start behaviors
-        startup_delay = max(250, int(getattr(self.settings, "safe_startup_delay_ms", 1500) or 1500))
+        startup_delay = max(1200, int(getattr(self.settings, "safe_startup_delay_ms", 2500) or 2500))
         self.after(startup_delay, self._auto_start)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _ui(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
-        if self._closing:
-            return
-        try:
-            self.after(0, lambda: fn(*args, **kwargs))
-        except Exception:
-            pass
-
-    def _run_bg(self, name: str, target: Callable[[], None]) -> None:
-        def runner() -> None:
-            try:
-                target()
-            except Exception as e:
-                self.log(f"[{name}] Background task failed: {e}")
-        threading.Thread(target=runner, name=name, daemon=True).start()
-
     def _chat_reply(self, text: str) -> None:
         self._remember_chat("assistant", text)
         self._chat_append("Simian", text)
@@ -316,9 +308,6 @@ class SimianApp(ctk.CTk):
     def _ensure_ollama_running(self, timeout: float = 8.0) -> bool:
         if port_in_use("127.0.0.1", 11434):
             return True
-        if not bool(getattr(self.settings, "auto_start_ollama", True)):
-            return False
-        timeout = float(getattr(self.settings, "ollama_start_timeout", timeout) or timeout)
         cmd = (os.environ.get("SIMIAN_OLLAMA_CMD") or "ollama serve").strip()
         try:
             self.log(f"[Chat] Starting Ollama backend: {cmd}")
@@ -535,11 +524,14 @@ class SimianApp(ctk.CTk):
     def _warm_backends(self) -> None:
         if self._closing:
             return
-        if not bool(getattr(self.settings, "warm_backends_on_launch", True)):
+        if not bool(getattr(self.settings, "warm_backends_on_launch", False)):
             self.log("[Startup] Backend warmup skipped by settings.")
             return
+        if not bool(getattr(self.settings, "auto_start_ollama", True)):
+            self.log("[Startup] Ollama auto-start is disabled; skipping warmup.")
+            return
         try:
-            self._ensure_ollama_running(timeout=10.0)
+            self._ensure_ollama_running(timeout=8.0)
         except Exception as e:
             self.log(f"[Startup] Ollama warmup skipped: {e}")
         try:
@@ -548,24 +540,42 @@ class SimianApp(ctk.CTk):
         except Exception as e:
             self.log(f"[Startup] Image backend warmup skipped: {e}")
 
+    def _request_start_replay_buffer(self) -> None:
+        if self._replay_start_inflight:
+            self.log("[Replay] Replay start already in progress.")
+            return
+        self._replay_start_inflight = True
+
+        def worker() -> None:
+            try:
+                self._start_replay_buffer()
+            finally:
+                self._replay_start_inflight = False
+
+        threading.Thread(target=worker, name="SimianReplayStart", daemon=True).start()
+
     def _auto_start(self) -> None:
         if self._closing or self._startup_inflight:
             return
         self._startup_inflight = True
-        self.log("[Startup] Beginning staged startup.")
-        self._run_bg("SimianWarmBackends", self._warm_backends)
+        self.log("[Startup] Beginning safe staged startup.")
+
+        if bool(getattr(self.settings, "warm_backends_on_launch", False)):
+            self.after(1200, lambda: threading.Thread(target=self._warm_backends, name="SimianWarmBackends", daemon=True).start())
+        else:
+            self.log("[Startup] Backend warmup is disabled.")
 
         if bool(getattr(self.settings, "auto_start_mic", False)) and getattr(self.settings, "stt_enabled", True):
-            self.after(400, lambda: self._run_bg("SimianAutoStartMic", lambda: self._start_mic_listener(hot_mode=False)))
+            self.after(2200, lambda: threading.Thread(target=lambda: self._start_mic_listener(hot_mode=False), name="SimianAutoStartMic", daemon=True).start())
         else:
             self.log("[Startup] Mic listener auto-start is disabled.")
 
         if bool(getattr(self.settings, "auto_start_replay", False)):
-            self.after(900, lambda: self._run_bg("SimianAutoStartReplay", self._start_replay_buffer))
+            self.after(4200, self._request_start_replay_buffer)
         else:
             self.log("[Startup] Replay buffer auto-start is disabled.")
 
-        self._schedule_news_refresh(initial=True)
+        self.after(5200, lambda: self._schedule_news_refresh(initial=True))
         self._startup_inflight = False
     # ----------------------- CHAT -----------------------
 
@@ -598,9 +608,6 @@ class SimianApp(ctk.CTk):
         self._sync_chat_mic_controls()
 
     def _chat_append(self, who: str, msg: str) -> None:
-        if threading.current_thread() is not threading.main_thread():
-            self._ui(self._chat_append, who, msg)
-            return
         self.chat_log.configure(state="normal")
         self.chat_log.insert("end", f"{who}: {msg}\n\n")
         self._trim_textbox(self.chat_log, max_chars=22000)
@@ -665,9 +672,6 @@ class SimianApp(ctk.CTk):
         self.after(0, apply_transcript)
 
     def _set_services_output(self, text: str) -> None:
-        if threading.current_thread() is not threading.main_thread():
-            self._ui(self._set_services_output, text)
-            return
         if hasattr(self, "services_out"):
             self.services_out.delete("1.0", "end")
             self.services_out.insert("end", text)
@@ -833,8 +837,8 @@ class SimianApp(ctk.CTk):
         self.lbl_replay = ctk.CTkLabel(ctrl, text="Replay buffer: stopped")
         self.lbl_replay.pack(side="left", padx=8)
 
-        ctk.CTkButton(ctrl, text="Start Buffer", command=self._request_start_replay_buffer).pack(side="left", padx=6)
-        ctk.CTkButton(ctrl, text="Stop Buffer", command=self._request_stop_replay_buffer).pack(side="left", padx=6)
+        ctk.CTkButton(ctrl, text="Start Buffer", command=self._start_replay_buffer).pack(side="left", padx=6)
+        ctk.CTkButton(ctrl, text="Stop Buffer", command=self._stop_replay_buffer).pack(side="left", padx=6)
         ctk.CTkButton(ctrl, text="Clip that", command=self._export_clip).pack(side="left", padx=6)
 
         self.extra_entry = ctk.CTkEntry(ctrl, width=120, placeholder_text="Extra sec")
@@ -858,23 +862,6 @@ class SimianApp(ctk.CTk):
 
         self._refresh_clips()
 
-    def _request_start_replay_buffer(self) -> None:
-        if self._replay_start_inflight:
-            self.log("[Replay] Start already in progress.")
-            return
-        self._replay_start_inflight = True
-
-        def worker() -> None:
-            try:
-                self._start_replay_buffer()
-            finally:
-                self._replay_start_inflight = False
-
-        self._run_bg("SimianReplayStart", worker)
-
-    def _request_stop_replay_buffer(self) -> None:
-        self._run_bg("SimianReplayStop", self._stop_replay_buffer)
-
     def _start_replay_buffer(self) -> None:
         sys_audio = (getattr(self.settings, "replay_system_audio_device", "") or os.environ.get("SIMIAN_SYSTEM_AUDIO") or "").strip()
         mic = (getattr(self.settings, "replay_mic_device", "") or os.environ.get("SIMIAN_MIC") or "").strip()
@@ -883,13 +870,13 @@ class SimianApp(ctk.CTk):
             mic=mic or None,
         )
         self.replay.start()
-        self._ui(self.lbl_replay.configure, text="Replay buffer: running")
+        self.lbl_replay.configure(text="Replay buffer: running")
         self.log("[Replay] Buffer running.")
-        self._run_bg("SimianReplaySpeak", lambda: self._speak("Replay buffer running."))
+        self._speak("Replay buffer running.")
 
     def _stop_replay_buffer(self) -> None:
         self.replay.stop()
-        self._ui(self.lbl_replay.configure, text="Replay buffer: stopped")
+        self.lbl_replay.configure(text="Replay buffer: stopped")
         self.log("[Replay] Buffer stopped.")
 
     def _export_clip(self) -> None:
@@ -1476,16 +1463,14 @@ class SimianApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _poll_status(self) -> None:
-        if self._closing:
-            return
         self.lbl_api.configure(text=f"API: {'running' if port_in_use(DEFAULT_API_HOST, DEFAULT_API_PORT) else 'stopped'}")
         listener = getattr(self, "mic_listener", None)
         if listener is not None and getattr(listener, "is_running", lambda: False)():
-            self._ui(self.lbl_mic.configure, text="Mic listener: running")
+            self.lbl_mic.configure(text="Mic listener: running")
         elif MicListenerService is None or self._resolve_vosk_model_dir() is None:
-            self._ui(self.lbl_mic.configure, text="Mic listener: unavailable")
+            self.lbl_mic.configure(text="Mic listener: unavailable")
         else:
-            self._ui(self.lbl_mic.configure, text="Mic listener: stopped")
+            self.lbl_mic.configure(text="Mic listener: stopped")
         self._sync_chat_mic_controls()
         self.after(1800, self._poll_status)
     def _start_api(self) -> None:
@@ -1498,8 +1483,7 @@ class SimianApp(ctk.CTk):
 
         def worker() -> None:
             try:
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-                self.api_proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), creationflags=creationflags)
+                self.api_proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT))
             except Exception as e:
                 self.after(0, lambda e=e: self.log(f"[API] Start failed: {e}"))
                 return
@@ -1557,21 +1541,15 @@ class SimianApp(ctk.CTk):
         self.chk_stt = ctk.CTkCheckBox(voice, text="STT / mic listener enabled", onvalue=1, offvalue=0)
         self.chk_stt.select() if getattr(self.settings, "stt_enabled", True) else self.chk_stt.deselect()
         self.chk_stt.grid(row=1, column=1, sticky="w", padx=8, pady=6)
-        self.chk_auto_mic = ctk.CTkCheckBox(voice, text="Auto-start mic listener on launch", onvalue=1, offvalue=0)
-        self.chk_auto_mic.select() if getattr(self.settings, "auto_start_mic", False) else self.chk_auto_mic.deselect()
-        self.chk_auto_mic.grid(row=2, column=0, sticky="w", padx=8, pady=6)
-        self.chk_warm_backends = ctk.CTkCheckBox(voice, text="Warm backends on launch", onvalue=1, offvalue=0)
-        self.chk_warm_backends.select() if getattr(self.settings, "warm_backends_on_launch", True) else self.chk_warm_backends.deselect()
-        self.chk_warm_backends.grid(row=2, column=1, sticky="w", padx=8, pady=6)
-        ctk.CTkLabel(voice, text="Voice ID (Edge TTS)").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkLabel(voice, text="Voice ID (Edge TTS)").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         self.voice_id_entry = ctk.CTkEntry(voice)
-        self.voice_id_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=6)
+        self.voice_id_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=6)
         self.voice_id_entry.insert(0, getattr(self.settings, "voice_id", ""))
-        ctk.CTkLabel(voice, text="Vosk model dir").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkLabel(voice, text="Vosk model dir").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         self.vosk_model_entry = ctk.CTkEntry(voice)
-        self.vosk_model_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=6)
+        self.vosk_model_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=6)
         self.vosk_model_entry.insert(0, getattr(self.settings, "vosk_model_dir", os.environ.get("VOSK_MODEL_DIR", "")))
-        ctk.CTkButton(voice, text="Browse", command=self._browse_vosk_model).grid(row=4, column=2, padx=8, pady=6)
+        ctk.CTkButton(voice, text="Browse", command=self._browse_vosk_model).grid(row=3, column=2, padx=8, pady=6)
 
         theme = ctk.CTkFrame(scroll)
         theme.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
@@ -1610,13 +1588,6 @@ class SimianApp(ctk.CTk):
         self.upscale_opt.set(getattr(self.settings, "export_upscale", "none"))
         self.upscale_opt.grid(row=6, column=1, sticky="w", padx=8, pady=6)
         ctk.CTkLabel(clips, text="Export upscale").grid(row=6, column=0, sticky="w", padx=8, pady=6)
-        self.chk_auto_replay = ctk.CTkCheckBox(clips, text="Auto-start replay buffer on launch", onvalue=1, offvalue=0)
-        self.chk_auto_replay.select() if getattr(self.settings, "auto_start_replay", False) else self.chk_auto_replay.deselect()
-        self.chk_auto_replay.grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=6)
-        ctk.CTkLabel(clips, text="Startup delay (ms)").grid(row=8, column=0, sticky="w", padx=8, pady=6)
-        self.entry_startup_delay = ctk.CTkEntry(clips, width=140)
-        self.entry_startup_delay.grid(row=8, column=1, sticky="w", padx=8, pady=6)
-        self.entry_startup_delay.insert(0, str(getattr(self.settings, "safe_startup_delay_ms", 1500)))
 
         news = ctk.CTkFrame(scroll)
         news.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
@@ -1802,9 +1773,6 @@ class SimianApp(ctk.CTk):
 
         self.settings.voice_enabled = self.chk_voice.get() == 1
         self.settings.stt_enabled = self.chk_stt.get() == 1
-        self.settings.auto_start_mic = self.chk_auto_mic.get() == 1
-        self.settings.auto_start_replay = self.chk_auto_replay.get() == 1
-        self.settings.warm_backends_on_launch = self.chk_warm_backends.get() == 1
         self.settings.voice_id = self.voice_id_entry.get().strip() or getattr(self.settings, "voice_id", "")
         self.settings.vosk_model_dir = self.vosk_model_entry.get().strip()
         self.settings.accent_hex = self.accent_entry.get().strip() or getattr(self.settings, "accent_hex", "#4da3ff")
@@ -1831,10 +1799,6 @@ class SimianApp(ctk.CTk):
             pass
 
         self.settings.export_upscale = self.upscale_opt.get()
-        try:
-            self.settings.safe_startup_delay_ms = max(250, int(self.entry_startup_delay.get().strip()))
-        except Exception:
-            pass
         try:
             self.settings.news_refresh_seconds = int(self.entry_news_refresh.get().strip())
         except Exception:
@@ -1871,13 +1835,11 @@ class SimianApp(ctk.CTk):
     # ----------------------- MIC LISTENER -----------------------
 
     def _start_mic_listener(self, hot_mode: bool = False) -> None:
-        if self._closing:
-            return
         model_dir = self._resolve_vosk_model_dir()
         if model_dir is not None:
             os.environ["VOSK_MODEL_DIR"] = str(model_dir)
         if MicListenerService is None:
-            self._ui(self.lbl_mic.configure, text="Mic listener: unavailable")
+            self.lbl_mic.configure(text="Mic listener: unavailable")
             self.log("[Voice] Mic listener unavailable (install vosk + sounddevice and provide a Vosk model folder).")
             self._sync_chat_mic_controls()
             return
@@ -1907,7 +1869,7 @@ class SimianApp(ctk.CTk):
 
         listener = self.mic_listener
         if listener is None:
-            self._ui(self.lbl_mic.configure, text="Mic listener: unavailable")
+            self.lbl_mic.configure(text="Mic listener: unavailable")
             self._sync_chat_mic_controls()
             return
 
@@ -1917,7 +1879,7 @@ class SimianApp(ctk.CTk):
 
         if not listener.available():
             reason = listener.unavailable_reason()
-            self._ui(self.lbl_mic.configure, text="Mic listener: unavailable")
+            self.lbl_mic.configure(text="Mic listener: unavailable")
             if model_dir is None:
                 self.log("[Voice] Mic listener unavailable: set VOSK_MODEL_DIR or choose a model in Settings.")
             self.log(f"[Voice] {reason}")
@@ -1926,7 +1888,7 @@ class SimianApp(ctk.CTk):
 
         if not getattr(listener, "is_running", lambda: False)():
             listener.start()
-        self._ui(self.lbl_mic.configure, text="Mic listener: running")
+        self.lbl_mic.configure(text="Mic listener: running")
         self._sync_chat_mic_controls()
 
     def _stop_mic_listener(self) -> None:
@@ -1939,7 +1901,7 @@ class SimianApp(ctk.CTk):
             except Exception:
                 pass
             listener.stop()
-        self._ui(self.lbl_mic.configure, text="Mic listener: stopped")
+        self.lbl_mic.configure(text="Mic listener: stopped")
         self._sync_chat_mic_controls()
 
     def _on_voice_command(self, cmd: str, meta: Dict[str, Any]) -> None:
@@ -1949,9 +1911,9 @@ class SimianApp(ctk.CTk):
             self.after(0, lambda: self.extra_entry.insert(0, str(extra)))
             self.after(0, self._export_clip)
         elif cmd == "buffer_start":
-            self.after(0, self._request_start_replay_buffer)
+            self.after(0, self._start_replay_buffer)
         elif cmd == "buffer_stop":
-            self.after(0, self._request_stop_replay_buffer)
+            self.after(0, self._stop_replay_buffer)
     # ----------------------- CLOSE -----------------------
 
     def _on_close(self) -> None:
@@ -1968,10 +1930,7 @@ class SimianApp(ctk.CTk):
             self._stop_api()
         except Exception:
             pass
-        try:
-            self.destroy()
-        except Exception:
-            pass
+        self.destroy()
 
 
 def main() -> None:

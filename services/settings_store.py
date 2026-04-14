@@ -41,11 +41,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "replay_system_audio_device": "",
     "replay_mic_device": "",
     "auto_start_ollama": True,
+    "warm_backends_on_launch": False,
     "auto_start_mic": False,
     "auto_start_replay": False,
-    "warm_backends_on_launch": True,
-    "safe_startup_delay_ms": 1500,
-    "ollama_start_timeout": 8,
+    "safe_startup_delay_ms": 2500,
 }
 
 

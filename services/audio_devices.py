@@ -15,9 +15,14 @@ try:
 except Exception:  # pragma: no cover
     sd = None
 
+DEFAULT_WASAPI_SYSTEM = "__DEFAULT_WASAPI__"
+LOOPBACK_HINT_RE = re.compile(r"stereo mix|what u hear|wave out mix|loopback|monitor", re.IGNORECASE)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FFMPEG_CANDIDATES = [
     REPO_ROOT / "ffmpeg.exe",
+    REPO_ROOT / "ffmpeg-7.1.1" / "bin" / "ffmpeg.exe",
+    REPO_ROOT / "ffmpeg" / "bin" / "ffmpeg.exe",
     REPO_ROOT / "bin" / "ffmpeg.exe",
     REPO_ROOT / "tools" / "ffmpeg.exe",
     Path("ffmpeg"),
@@ -26,6 +31,8 @@ FFMPEG_CANDIDATES = [
 
 def _find_ffmpeg() -> str:
     for candidate in FFMPEG_CANDIDATES:
+        if str(candidate) == "ffmpeg":
+            return "ffmpeg"
         if candidate.exists():
             return str(candidate)
     return "ffmpeg"
@@ -108,6 +115,46 @@ def list_dshow_audio_devices() -> List[str]:
     return names
 
 
+def _sounddevice_input_names() -> List[str]:
+    names: List[str] = []
+    for dev in list_sounddevice_devices().get("inputs", []):
+        name = str(dev.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def list_replay_system_choices() -> List[str]:
+    names = [DEFAULT_WASAPI_SYSTEM]
+    for name in list_dshow_audio_devices():
+        if name not in names:
+            names.append(name)
+    for name in _sounddevice_input_names():
+        if LOOPBACK_HINT_RE.search(name) and name not in names:
+            names.append(name)
+    return names
+
+
+def list_replay_mic_choices() -> List[str]:
+    names = [""]
+    for name in list_dshow_audio_devices():
+        if name not in names:
+            names.append(name)
+    for name in _sounddevice_input_names():
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def pick_best_system_audio_choice() -> str:
+    for name in list_replay_system_choices():
+        if name == DEFAULT_WASAPI_SYSTEM:
+            continue
+        if LOOPBACK_HINT_RE.search(name):
+            return name
+    return DEFAULT_WASAPI_SYSTEM
+
+
 def main() -> int:
     sd_info = list_sounddevice_devices()
     print("Sounddevice input devices:")
@@ -119,6 +166,15 @@ def main() -> int:
     for dev in sd_info["outputs"]:
         mark = " *default" if dev.get("default") else ""
         print(f"  {dev['index']}: {dev['name']}{mark}")
+
+    print("\nReplay system-audio choices:")
+    for name in list_replay_system_choices():
+        label = "Default / auto-detect loopback" if name == DEFAULT_WASAPI_SYSTEM else name
+        print(f"  {label}")
+
+    print("\nReplay microphone choices:")
+    for name in list_replay_mic_choices():
+        print(f"  {name or '(none)'}")
 
     print("\nFFmpeg DirectShow audio names:")
     for name in list_dshow_audio_devices():

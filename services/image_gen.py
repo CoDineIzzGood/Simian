@@ -7,8 +7,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw
-
 _BACKEND_PROC: Optional[subprocess.Popen] = None
 
 
@@ -16,18 +14,6 @@ def _ensure_dir(p: str | Path) -> Path:
     p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
-
-
-def _placeholder(prompt: str, out_path: Path, width: int = 768, height: int = 768) -> Path:
-    img = Image.new("RGB", (width, height), (10, 12, 18))
-    draw = ImageDraw.Draw(img)
-    text = (prompt or "")[:220]
-    draw.text((20, 20), "Simian image tool (placeholder)", fill=(220, 230, 255))
-    draw.text((20, 60), text, fill=(180, 200, 255))
-    draw.rectangle((40, 140, width - 40, height - 40), outline=(90, 130, 220), width=4)
-    draw.text((60, 160), "No real image backend configured.", fill=(255, 200, 160))
-    img.save(out_path, "PNG")
-    return out_path.resolve()
 
 
 def _load_backend():
@@ -74,10 +60,16 @@ def txt2img_generate(
             result = txt2img_auto(prompt=prompt, out_dir=out_dir, backend=backend, width=width, height=height)
             return str(Path(result).resolve())
 
-    allow_placeholder = os.environ.get("SIMIAN_ALLOW_PLACEHOLDER_IMAGES", "1").strip().lower() not in {"0", "false", "no"}
+    allow_placeholder = os.environ.get("SIMIAN_ALLOW_PLACEHOLDER_IMAGES", "0").strip().lower() in {"1", "true", "yes"}
     if allow_placeholder:
-        return str(_placeholder(prompt, target, width=width, height=height))
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (width, height), (10, 12, 18))
+        draw = ImageDraw.Draw(img)
+        draw.text((20, 20), "Simian image tool placeholder (opt-in)", fill=(220, 230, 255))
+        draw.text((20, 60), (prompt or "")[:220], fill=(180, 200, 255))
+        img.save(target, "PNG")
+        return str(target.resolve())
 
     raise RuntimeError(
-        "No real image backend is configured. Install the generative.image_tools backend or set SIMIAN_IMAGE_BACKEND_CMD."
+        "No real image backend is configured. Install the generative.image_tools backend or set SIMIAN_IMAGE_BACKEND_CMD. Placeholders are disabled by default."
     )

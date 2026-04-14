@@ -29,7 +29,10 @@ COMMAND_PATTERNS = {
     "buffer_start": re.compile(r"\b(start buffer|start replay)\b", re.IGNORECASE),
     "buffer_stop": re.compile(r"\b(stop buffer|stop replay)\b", re.IGNORECASE),
 }
-IGNORE_UTTERANCES = {"huh", "uh", "um", "hmm", "hm", "mm"}
+IGNORE_UTTERANCES = {"huh", "uh", "um", "hmm", "hm", "mm", "oh"}
+SIMIAN_ALIASES = re.compile(r"\b(?:semyon|semion|semi on|sim eon|simiann)\b", re.IGNORECASE)
+AUTOMATION_CONTEXT = re.compile(r"\b(script|scripts|task|tasks|workflow|workflows|system|systems|file|files|pipeline|pipelines|process|processes|automation)\b", re.IGNORECASE)
+ANIMATION_CONTEXT = re.compile(r"\b(cartoon|movie|video|animate|animation studio|anime)\b", re.IGNORECASE)
 
 
 def _find_vosk_model_dir() -> Optional[Path]:
@@ -63,6 +66,8 @@ class MicListenerConfig:
     samplerate: int = 16000
     device: Optional[int] = None
     wake_word: str = "simian"
+    phrase_end_silence_sec: float = 1.15
+    min_transcript_words: int = 2
 
 
 class MicListenerService:
@@ -83,6 +88,10 @@ class MicListenerService:
         self.hot_mode = False
         self._last_text = ""
         self._last_text_ts = 0.0
+        self._pending_spoken = ""
+        self._pending_meta: Dict[str, Any] = {}
+        self._flush_timer: Optional[threading.Timer] = None
+        self._pending_lock = threading.Lock()
 
     def available(self) -> bool:
         return self._available and (_find_vosk_model_dir() is not None)
@@ -114,9 +123,9 @@ class MicListenerService:
 
     def stop(self) -> None:
         self._stop.set()
-        thread = self._thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2)
+        self._cancel_pending_flush()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
         self.log("[Voice] Mic listener stopped.")
 
     def _run(self) -> None:
@@ -129,13 +138,9 @@ class MicListenerService:
             self.log("[Voice] No Vosk model directory found.")
             return
 
-        try:
-            model = Model(str(model_dir))
-            rec = KaldiRecognizer(model, self.config.samplerate)
-            rec.SetWords(False)
-        except Exception as e:
-            self.log(f"[Voice] Failed to initialize Vosk model: {e}")
-            return
+        model = Model(str(model_dir))
+        rec = KaldiRecognizer(model, self.config.samplerate)
+        rec.SetWords(False)
 
         def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             if self._stop.is_set():
@@ -168,19 +173,25 @@ class MicListenerService:
             self.log("[Voice] sounddevice.RawInputStream is unavailable.")
             return
 
-        try:
-            with raw_stream(
-                samplerate=self.config.samplerate,
-                blocksize=8000,
-                dtype="int16",
-                channels=1,
-                callback=callback,
-                device=self.config.device,
-            ):
-                while not self._stop.is_set():
-                    time.sleep(0.1)
-        except Exception as e:
-            self.log(f"[Voice] Mic stream failed: {e}")
+        with raw_stream(
+            samplerate=self.config.samplerate,
+            blocksize=8000,
+            dtype="int16",
+            channels=1,
+            callback=callback,
+            device=self.config.device,
+        ):
+            while not self._stop.is_set():
+                time.sleep(0.1)
+
+    def _normalize_text(self, text: str) -> str:
+        heard = " ".join((text or "").strip().split())
+        if not heard:
+            return ""
+        heard = SIMIAN_ALIASES.sub("simian", heard)
+        if "animation" in heard and AUTOMATION_CONTEXT.search(heard) and not ANIMATION_CONTEXT.search(heard):
+            heard = re.sub(r"\banimation\b", "automation", heard)
+        return heard.strip().lower()
 
     def _extract_after_wake(self, text: str) -> str:
         cleaned = (text or "").strip()
@@ -204,8 +215,56 @@ class MicListenerService:
         self._last_text_ts = now
         return False
 
+    def _cancel_pending_flush(self) -> None:
+        timer = self._flush_timer
+        self._flush_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _flush_pending_transcript(self) -> None:
+        with self._pending_lock:
+            spoken = self._pending_spoken.strip()
+            meta = dict(self._pending_meta)
+            self._pending_spoken = ""
+            self._pending_meta = {}
+            self._flush_timer = None
+        if not spoken or self._stop.is_set():
+            return
+        words = [w for w in spoken.split() if w]
+        if len(words) < max(1, int(getattr(self.config, "min_transcript_words", 1) or 1)):
+            self.log(f"[Voice] Waiting for more speech, held transcript: {spoken}")
+            return
+        self.transcript_cb(spoken, meta)
+
+    def _queue_transcript(self, spoken: str, meta: Dict[str, Any]) -> None:
+        snippet = " ".join((spoken or "").strip().split())
+        if not snippet:
+            return
+        with self._pending_lock:
+            if self._pending_spoken:
+                existing = self._pending_spoken
+                if snippet == existing or snippet in existing:
+                    merged = existing
+                elif existing in snippet:
+                    merged = snippet
+                else:
+                    merged = f"{existing} {snippet}".strip()
+                self._pending_spoken = merged
+            else:
+                self._pending_spoken = snippet
+            self._pending_meta = dict(meta)
+            self._pending_meta["hot_mode"] = self.hot_mode
+            self._cancel_pending_flush()
+            delay = max(0.35, float(getattr(self.config, "phrase_end_silence_sec", 1.15) or 1.15))
+            self._flush_timer = threading.Timer(delay, self._flush_pending_transcript)
+            self._flush_timer.daemon = True
+            self._flush_timer.start()
+
     def _handle_text(self, text: str) -> None:
-        heard = (text or "").strip().lower()
+        heard = self._normalize_text(text)
         if not heard or heard in IGNORE_UTTERANCES:
             return
         if self._is_duplicate(heard):
@@ -220,10 +279,11 @@ class MicListenerService:
                     match = re.search(r"(?:plus|extra)\s+(\d+)\s*(seconds|second|sec|s)?", heard)
                     if match:
                         meta["extra_seconds"] = int(match.group(1))
+                self._cancel_pending_flush()
                 self.command_cb(name, meta)
                 return
 
         spoken = self._extract_after_wake(heard)
         if not spoken or spoken in IGNORE_UTTERANCES or len(spoken) < 2:
             return
-        self.transcript_cb(spoken, {"raw": heard, "hot_mode": self.hot_mode})
+        self._queue_transcript(spoken, {"raw": heard, "hot_mode": self.hot_mode})
