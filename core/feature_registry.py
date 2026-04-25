@@ -34,6 +34,23 @@ class FeatureRegistry:
 feature_registry = FeatureRegistry()
 
 
+def _screen_awareness_health() -> HealthState:
+    """Deferred health probe for the screen awareness feature.
+
+    Imported lazily so core.feature_registry remains importable even if
+    optional screen-capture deps (mss/PIL/httpx) aren't installed.
+    """
+    try:
+        from services.screen_awareness import get_screen_awareness
+        return get_screen_awareness().health()
+    except Exception as exc:
+        return HealthState(
+            name="screen_awareness",
+            status="error",
+            message=f"import_failed: {exc}",
+        )
+
+
 def _register_default_features() -> None:
     defaults = [
         FeatureSpec(key="chat", display_name="Chat", description="Local chat assistant"),
@@ -42,7 +59,13 @@ def _register_default_features() -> None:
         FeatureSpec(key="files", display_name="Files", description="Local file scanning and summarization"),
         FeatureSpec(key="image_gen", display_name="Image Generation", description="Text-to-image generation"),
         FeatureSpec(key="news", display_name="News", settings_key="news_default_category", description="RSS-backed world + tech news"),
-        FeatureSpec(key="screen_awareness", display_name="Screen Awareness", description="Screen context and monitoring"),
+        FeatureSpec(
+            key="screen_awareness",
+            display_name="Screen Awareness",
+            settings_key="screen_awareness_enabled",
+            health_check=_screen_awareness_health,
+            description="On-demand screen context capture with optional local vision summarization",
+        ),
         FeatureSpec(key="video_gen", display_name="Video Generation", description="Text-to-video generation"),
         FeatureSpec(key="world_tracker", display_name="World Tracker", description="External/world signal tracking"),
     ]
