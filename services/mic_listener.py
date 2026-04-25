@@ -25,12 +25,59 @@ CommandCallback = Callable[[str, Dict[str, Any]], None]
 TranscriptCallback = Callable[[str, Dict[str, Any]], None]
 
 COMMAND_PATTERNS = {
+    # "clip" stays first so replay export is never pre-empted by other
+    # intents (replay-first rule from the project brief).
     "clip": re.compile(r"\bclip that\b", re.IGNORECASE),
     "buffer_start": re.compile(r"\b(start buffer|start replay)\b", re.IGNORECASE),
     "buffer_stop": re.compile(r"\b(stop buffer|stop replay)\b", re.IGNORECASE),
+    # Screen Awareness voice intents. Only trigger when awareness is
+    # enabled in settings; the GUI handler enforces that check so the
+    # listener stays dumb.
+    "screen_look": re.compile(
+        # "at" and "on" are both accepted after "look(ing)" -- STT
+        # commonly emits "look on my screen" for "look at my screen".
+        r"\b(?:look(?:ing)? (?:at|on) (?:my |the )?screen"
+        r"|what(?:'s| is|s)? on (?:my |the )?screen"
+        r"|what am i looking at"
+        r"|describe (?:my |the )?screen"
+        r"|can you see (?:my |the )?screen"
+        r"|see what(?:'s| is)? on (?:my |the )?screen"
+        r"|(?:see|show me|read|check|analy[sz]e) (?:my |the )?screen)\b",
+        re.IGNORECASE,
+    ),
+    "screen_pause": re.compile(
+        r"\b(?:pause|stop|disable)\s+screen\s+(?:awareness|monitoring)\b",
+        re.IGNORECASE,
+    ),
+    "screen_resume": re.compile(
+        r"\b(?:resume|start|enable)\s+screen\s+(?:awareness|monitoring)\b",
+        re.IGNORECASE,
+    ),
 }
 IGNORE_UTTERANCES = {"huh", "uh", "um", "hmm", "hm", "mm", "oh"}
-SIMIAN_ALIASES = re.compile(r"\b(?:semyon|semion|semi on|sim eon|simiann)\b", re.IGNORECASE)
+# Pass S-B: filler / politeness words that frequently lead a wake
+# phrase ("hey simian", "ok simian", "please simian", "a simian"). We
+# strip them after the wake-word split so "hey simian what time is it"
+# leaves the cleaner command "what time is it" for the rest of the
+# pipeline. Kept narrow on purpose -- random English fillers like
+# "really" or "now" stay in because they often carry intent.
+WAKE_LEADING_FILLER = {"hey", "ok", "okay", "yo", "please", "a", "the", "uh", "um", "well"}
+
+# Pass S-A: widened alias map. Vosk's small en-US model consistently
+# mishears "Simian" as one of these surface forms on the user's box;
+# normalize them before any wake-word / command logic so a 70%-accurate
+# Vosk transcript still routes correctly. Order doesn't matter -- all
+# variants collapse to the canonical "simian" via the same substitution.
+# Multi-token forms ("semi him", "sim eon") are listed BEFORE single
+# tokens with overlapping substrings so the regex engine prefers them
+# (Python's re returns the leftmost-longest at each scan position).
+SIMIAN_ALIASES = re.compile(
+    r"\b(?:"
+    r"semi\s+him|sim\s+eon|semi\s+on|"  # multi-token mishears
+    r"semyon|semion|simion|simeon|symian|simiann|cimian|cymian"
+    r")\b",
+    re.IGNORECASE,
+)
 AUTOMATION_CONTEXT = re.compile(r"\b(script|scripts|task|tasks|workflow|workflows|system|systems|file|files|pipeline|pipelines|process|processes|automation)\b", re.IGNORECASE)
 ANIMATION_CONTEXT = re.compile(r"\b(cartoon|movie|video|animate|animation studio|anime)\b", re.IGNORECASE)
 
@@ -84,6 +131,13 @@ class MicListenerService:
         self.config = config or MicListenerConfig()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        # Pass R-C: pause flag for STT/replay-mic coordination. When set,
+        # _run() releases the input stream so the replay buffer's
+        # AudioFallbackRecorder can claim the same default mic device,
+        # then waits for resume() before reopening. The Vosk model stays
+        # loaded across the pause (model load is the expensive part), so
+        # resume is near-instant.
+        self._paused = threading.Event()
         self._available = sd is not None and Model is not None and KaldiRecognizer is not None
         self.hot_mode = False
         self._last_text = ""
@@ -92,9 +146,20 @@ class MicListenerService:
         self._pending_meta: Dict[str, Any] = {}
         self._flush_timer: Optional[threading.Timer] = None
         self._pending_lock = threading.Lock()
+        # Surface runtime-truthful startup failures (e.g. stale PortAudio
+        # device id) to callers without requiring them to scrape logs.
+        self._last_error: Optional[str] = None
 
     def available(self) -> bool:
         return self._available and (_find_vosk_model_dir() is not None)
+
+    def last_error(self) -> Optional[str]:
+        """Return the last startup/stream error seen by _run(), if any.
+
+        Callers use this after start() to confirm the listener actually
+        opened the input device. None means 'no recorded failure'.
+        """
+        return self._last_error
 
     def unavailable_reason(self) -> str:
         if sd is None or Model is None or KaldiRecognizer is None:
@@ -106,9 +171,45 @@ class MicListenerService:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
 
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
+
+    def pause(self) -> None:
+        """Release the input device but keep the listener thread + Vosk
+        model alive. Used by the replay buffer's audio fallback so it can
+        open the same default mic device without fighting the STT path.
+        Idempotent. The listener thread observes ``_paused`` inside its
+        stream loop and exits the ``with stream:`` block cleanly.
+        """
+        if self._paused.is_set():
+            return
+        self._paused.set()
+        self.log("[STT] paused due to replay capture")
+
+    def resume(self) -> None:
+        """Reopen the input stream after a pause. Idempotent. If the
+        listener thread already died (e.g. user stopped between pause
+        and resume), this is a no-op -- _start_mic_listener restarts it.
+        """
+        if not self._paused.is_set():
+            return
+        self._paused.clear()
+        self.log("[STT] resumed after replay capture")
+
     def set_hot_mode(self, enabled: bool) -> None:
+        prev = self.hot_mode
         self.hot_mode = bool(enabled)
-        self.log(f"[Voice] Listener mode: {'hot mic' if self.hot_mode else 'wake word'}.")
+        # Pass R-B: when transitioning between modes, clear the
+        # duplicate-suppression cache so a phrase the user just spoke as
+        # the wake-word trigger doesn't get rejected as a "duplicate
+        # within 2s" the moment hot mic flips on (a real symptom users
+        # were hitting where the first hot-mic utterance silently dropped).
+        if prev != self.hot_mode:
+            self._last_text = ""
+            self._last_text_ts = 0.0
+        self.log(
+            f"[Voice] Listener mode: {'hot mic' if self.hot_mode else 'wake word'}."
+        )
 
     def start(self) -> None:
         if self.is_running():
@@ -116,6 +217,7 @@ class MicListenerService:
         if not self.available():
             self.log(f"[Voice] {self.unavailable_reason()}")
             return
+        self._last_error = None
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="MicListenerService", daemon=True)
         self._thread.start()
@@ -123,6 +225,11 @@ class MicListenerService:
 
     def stop(self) -> None:
         self._stop.set()
+        # Clear pause so the _run() pause loop falls through to the
+        # _stop check and exits instead of spinning until is_running()
+        # eventually reports false. Order matters: set _stop first so
+        # the post-pause iteration bails out before reopening the stream.
+        self._paused.clear()
         self._cancel_pending_flush()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
@@ -138,12 +245,36 @@ class MicListenerService:
             self.log("[Voice] No Vosk model directory found.")
             return
 
+        # Pass R-A: surface every gate the user asked for. Absolute path
+        # (so a wrong VOSK_MODEL_DIR is obvious in the log), the actual
+        # device id we'll pass to PortAudio, the listener mode, and the
+        # samplerate. Resolved device name is best-effort; PortAudio can
+        # raise on query_devices() if the backend just got unplugged.
+        try:
+            model_abs = str(Path(model_dir).resolve())
+        except Exception:
+            model_abs = str(model_dir)
+        device_label = self._describe_device(self.config.device)
+        self.log(
+            f"[Voice] Listener thread starting; device={self.config.device!r} "
+            f"({device_label}); samplerate={self.config.samplerate}; "
+            f"mode={'hot mic' if self.hot_mode else 'wake word'}."
+        )
+        self.log(f"[Voice] Vosk model path: {model_abs}")
+
         model = Model(str(model_dir))
         rec = KaldiRecognizer(model, self.config.samplerate)
         rec.SetWords(False)
 
+        # Chunk counter for the "audio chunk received" gate. We emit a
+        # single summary every CHUNK_LOG_EVERY chunks (~ once every 100s
+        # at 16 kHz / 8000 frames per chunk) instead of one log line per
+        # chunk -- the latter would drown the log textbox.
+        chunk_state: Dict[str, int] = {"chunks": 0, "since_last_log": 0}
+        CHUNK_LOG_EVERY = 200
+
         def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
-            if self._stop.is_set():
+            if self._stop.is_set() or self._paused.is_set():
                 callback_stop = getattr(sd, "CallbackStop", None)
                 if callback_stop is not None:
                     raise callback_stop()
@@ -159,30 +290,118 @@ class MicListenerService:
                 except Exception:
                     return
 
+            chunk_state["chunks"] += 1
+            chunk_state["since_last_log"] += 1
+            if chunk_state["since_last_log"] >= CHUNK_LOG_EVERY:
+                self.log(
+                    f"[Voice] Audio chunks received: {chunk_state['chunks']} "
+                    f"(rolling)."
+                )
+                chunk_state["since_last_log"] = 0
+
             if rec.AcceptWaveform(data):
                 try:
                     result = json.loads(rec.Result())
                     text = str(result.get("text") or "").strip().lower()
                     if text:
+                        # Pass R-A: log the raw Vosk transcript before any
+                        # normalization / dedupe / wake-word checks. Lets
+                        # us tell "Vosk is silent" from "we filtered it".
+                        self.log(f"[Voice] Vosk raw: {text}")
                         self._handle_text(text)
                 except Exception:
                     return
 
         raw_stream = getattr(sd, "RawInputStream", None)
         if raw_stream is None:
-            self.log("[Voice] sounddevice.RawInputStream is unavailable.")
+            msg = "sounddevice.RawInputStream is unavailable"
+            self._last_error = msg
+            self.log(f"[Voice] {msg}.")
             return
 
-        with raw_stream(
-            samplerate=self.config.samplerate,
-            blocksize=8000,
-            dtype="int16",
-            channels=1,
-            callback=callback,
-            device=self.config.device,
-        ):
-            while not self._stop.is_set():
+        # Pass R-C: pause-aware outer loop. Each iteration opens a fresh
+        # input stream. When pause() fires, the inner with-block exits
+        # cleanly (the stream callback raises CallbackStop), the device
+        # is released so the replay buffer's AudioFallbackRecorder can
+        # claim the same default mic, and we spin in the pause loop
+        # below until resume() clears the flag. _stop short-circuits the
+        # whole thing so close-during-pause still tears down cleanly.
+        first_open = True
+        while not self._stop.is_set():
+            if self._paused.is_set():
+                # Sleep in small increments so stop() during a pause
+                # joins promptly. 100ms matches the original poll cadence.
                 time.sleep(0.1)
+                continue
+
+            try:
+                stream = raw_stream(
+                    samplerate=self.config.samplerate,
+                    blocksize=8000,
+                    dtype="int16",
+                    channels=1,
+                    callback=callback,
+                    device=self.config.device,
+                )
+            except Exception as exc:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self.log(
+                    f"[Voice] Mic listener could not open input device "
+                    f"{self.config.device!r}: {exc}"
+                )
+                self._stop.set()
+                return
+
+            if first_open:
+                self.log(
+                    f"[Voice] Input stream opened on device={self.config.device!r}; "
+                    f"listener active."
+                )
+                first_open = False
+            else:
+                self.log("[Voice] Input stream reopened after pause.")
+
+            try:
+                with stream:
+                    while not self._stop.is_set() and not self._paused.is_set():
+                        time.sleep(0.1)
+            except Exception as exc:
+                # CallbackStop from the pause path is expected and clean;
+                # only log noisy stream errors.
+                msg = f"{type(exc).__name__}: {exc}"
+                if "CallbackStop" not in msg:
+                    self._last_error = msg
+                    self.log(f"[Voice] Mic listener stream error: {exc}")
+                    self._stop.set()
+                    return
+
+            if self._paused.is_set() and not self._stop.is_set():
+                self.log("[Voice] Input stream closed for pause; awaiting resume.")
+
+        self.log("[Voice] Listener thread stopped.")
+
+    def _describe_device(self, device: Optional[int]) -> str:
+        """Best-effort PortAudio device name lookup for log lines.
+
+        Returns ``"default"`` when ``device`` is None (PortAudio uses the
+        OS default), the device's ``name`` field when query_devices()
+        returns one, or ``"unknown"`` when the backend refuses (e.g. mid
+        unplug). Never raises -- this is a logging convenience only.
+        """
+        if device is None:
+            return "default"
+        if sd is None:
+            return "unknown"
+        try:
+            info = sd.query_devices(device)  # type: ignore[union-attr]
+            name = ""
+            if isinstance(info, dict):
+                name = str(info.get("name") or "").strip()
+            elif info is not None:
+                name = str(getattr(info, "name", "") or "").strip()
+            return name or f"index {device}"
+        except Exception:
+            return f"index {device}"
 
     def _normalize_text(self, text: str) -> str:
         heard = " ".join((text or "").strip().split())
@@ -194,18 +413,43 @@ class MicListenerService:
         return heard.strip().lower()
 
     def _extract_after_wake(self, text: str) -> str:
-        cleaned = (text or "").strip()
+        cleaned = (text or "").strip(" ,.!?-")
         if not cleaned:
             return ""
-        if self.hot_mode:
-            return cleaned
         wake = (self.config.wake_word or "").strip().lower()
         if not wake:
-            return cleaned
+            return self._strip_filler(cleaned)
+        # Pass S-B: in hot mode, peel a leading "[filler]* simian"
+        # prefix off if present, otherwise treat the whole utterance
+        # as the command. Filler is stripped both before AND after
+        # the wake split so "hey simian please clip that" reduces to
+        # "clip that".
+        if self.hot_mode:
+            if wake in cleaned:
+                head, _, tail = cleaned.partition(wake)
+                if not self._strip_filler(head):
+                    return self._strip_filler(tail.strip(" ,.!?-"))
+            return self._strip_filler(cleaned)
+        # Wake-word mode: utterance MUST contain the wake word.
         if wake not in cleaned:
             return ""
         parts = cleaned.split(wake, 1)
-        return parts[1].strip(" ,.!?-")
+        return self._strip_filler(parts[1].strip(" ,.!?-"))
+
+    def _strip_filler(self, text: str) -> str:
+        """Drop leading filler words like 'hey'/'please'/'a' that voice
+        users naturally say before a command. Iterative so multi-token
+        prefixes ("hey please") collapse on a single call.
+        """
+        cleaned = (text or "").strip(" ,.!?-")
+        while True:
+            tokens = cleaned.split()
+            if not tokens:
+                return ""
+            head = tokens[0].lower()
+            if head not in WAKE_LEADING_FILLER:
+                return cleaned
+            cleaned = " ".join(tokens[1:]).strip(" ,.!?-")
 
     def _is_duplicate(self, text: str) -> bool:
         now = time.time()
@@ -264,10 +508,30 @@ class MicListenerService:
             self._flush_timer.start()
 
     def _handle_text(self, text: str) -> None:
+        # Pass S-A: log the truly raw transcript (before alias substitution)
+        # so we can prove the alias map is doing what we expect. The
+        # callback in _run already logs '[Voice] Vosk raw:'; this line
+        # gives us the post-strip / pre-alias view too.
+        raw = " ".join((text or "").strip().split())
         heard = self._normalize_text(text)
-        if not heard or heard in IGNORE_UTTERANCES:
+        wake = (self.config.wake_word or "").strip().lower()
+        had_wake = bool(wake) and wake in heard
+        if heard != raw:
+            self.log(
+                f"[Voice] Normalized: raw='{raw}' -> normalized='{heard}' "
+                f"(wake_match={had_wake})"
+            )
+        else:
+            self.log(f"[Voice] Normalized: '{heard}' (wake_match={had_wake})")
+
+        if not heard:
+            self.log(f"[Voice] Rejected (empty after normalize): {text!r}")
+            return
+        if heard in IGNORE_UTTERANCES:
+            self.log(f"[Voice] Rejected (ignore-utterance): {heard}")
             return
         if self._is_duplicate(heard):
+            self.log(f"[Voice] Rejected (duplicate within 2s): {heard}")
             return
 
         self.log(f"[Voice] Heard: {heard}")
@@ -280,10 +544,35 @@ class MicListenerService:
                     if match:
                         meta["extra_seconds"] = int(match.group(1))
                 self._cancel_pending_flush()
+                # Pass R-D: explicit accept log so every transcript has
+                # exactly one accepted/rejected line in the GUI textbox.
+                self.log(f"[Voice] Command routed: {name} (raw='{heard}')")
                 self.command_cb(name, meta)
                 return
 
         spoken = self._extract_after_wake(heard)
-        if not spoken or spoken in IGNORE_UTTERANCES or len(spoken) < 2:
+        # Pass S-B: when the wake word fired but nothing meaningful
+        # follows ("hey simian", "simian"), don't silently drop -- emit
+        # a synthetic 'wake_acknowledge' command so the GUI can play a
+        # ready/listening response. Only fires in wake-word mode (in hot
+        # mode the heard text becomes the spoken command directly).
+        if not spoken:
+            if had_wake and not self.hot_mode:
+                self.log(f"[Voice] Wake-only utterance: {heard}")
+                self._cancel_pending_flush()
+                self.command_cb("wake_acknowledge", {"raw": heard})
+                return
+            mode = "hot mic" if self.hot_mode else "wake word"
+            self.log(
+                f"[Voice] Rejected (no '{self.config.wake_word}' wake word in "
+                f"{mode} mode): {heard}"
+            )
             return
+        if spoken in IGNORE_UTTERANCES:
+            self.log(f"[Voice] Rejected (ignore-utterance after wake): {spoken}")
+            return
+        if len(spoken) < 2:
+            self.log(f"[Voice] Rejected (too short after wake): {spoken!r}")
+            return
+        self.log(f"[Voice] Transcript queued for flush: {spoken}")
         self._queue_transcript(spoken, {"raw": heard, "hot_mode": self.hot_mode})

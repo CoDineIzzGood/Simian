@@ -17,6 +17,12 @@ except Exception:  # pragma: no cover
 
 DEFAULT_WASAPI_SYSTEM = "__DEFAULT_WASAPI__"
 LOOPBACK_HINT_RE = re.compile(r"stereo mix|what u hear|wave out mix|loopback|monitor", re.IGNORECASE)
+# VB-Audio "Virtual Audio Capturer" is a free DirectShow filter that
+# captures the default playback mix even when Stereo Mix is disabled on
+# Windows 11. When present it's by far the most reliable desktop-audio
+# source for FFmpeg's dshow demuxer, so prefer it over plain loopback
+# hints in auto-pick.
+VAC_HINT_RE = re.compile(r"virtual[- ]audio[- ]capturer|vb[- ]?audio|voicemeeter|voicemeter", re.IGNORECASE)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FFMPEG_CANDIDATES = [
@@ -130,7 +136,10 @@ def list_replay_system_choices() -> List[str]:
         if name not in names:
             names.append(name)
     for name in _sounddevice_input_names():
-        if LOOPBACK_HINT_RE.search(name) and name not in names:
+        # Surface both loopback-ish and VAC-ish sounddevice names. VAC
+        # installs as a sounddevice input too, so hinting on just the
+        # loopback keywords would skip it.
+        if (LOOPBACK_HINT_RE.search(name) or VAC_HINT_RE.search(name)) and name not in names:
             names.append(name)
     return names
 
@@ -147,7 +156,23 @@ def list_replay_mic_choices() -> List[str]:
 
 
 def pick_best_system_audio_choice() -> str:
-    for name in list_replay_system_choices():
+    # Priority order:
+    #   1. Virtual Audio Capturer (VAC) / VB-Audio / Voicemeeter --
+    #      these actually capture whatever Windows is playing even
+    #      when Stereo Mix is disabled (default on Win11), so they
+    #      succeed where plain loopback fails.
+    #   2. Stereo Mix / "What U Hear" / loopback / monitor -- the
+    #      legacy Windows path. Works when the user has enabled it.
+    #   3. DEFAULT_WASAPI_SYSTEM sentinel -- means "no concrete
+    #      loopback capture device available; caller should either
+    #      drop desktop audio or log the enablement hint".
+    choices = list_replay_system_choices()
+    for name in choices:
+        if name == DEFAULT_WASAPI_SYSTEM:
+            continue
+        if VAC_HINT_RE.search(name):
+            return name
+    for name in choices:
         if name == DEFAULT_WASAPI_SYSTEM:
             continue
         if LOOPBACK_HINT_RE.search(name):
