@@ -27,6 +27,8 @@ if str(REPO_ROOT) not in sys.path:
 
 import customtkinter as ctk
 
+from core.task_runner import get_task_runner
+from gui.widgets.status_badge import StatusBadge
 from services.settings_store import Settings, load_settings, save_settings
 from services.replay_buffer import CaptureDevices, ReplayBufferRecorder
 from services.file_scanner import FileScannerService
@@ -181,6 +183,7 @@ class SimianApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
 
         self.settings: Settings = load_settings()
+        self.task_runner = get_task_runner()
 
         # Telemetry throttling
         self._telemetry_last_ts = 0.0
@@ -1368,7 +1371,7 @@ class SimianApp(ctk.CTk):
             except Exception:
                 pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.task_runner.start_background(worker)
 
     # ----------------------- SERVICES -----------------------
 
@@ -1382,6 +1385,8 @@ class SimianApp(ctk.CTk):
         api.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
         self.lbl_api = ctk.CTkLabel(api, text="API: unknown")
         self.lbl_api.pack(side="left", padx=8)
+        self.badge_api = StatusBadge(api, label="API", status="unknown")
+        self.badge_api.pack(side="left", padx=(4, 8))
         ctk.CTkButton(api, text="Start API", command=self._start_api).pack(side="left", padx=6)
         ctk.CTkButton(api, text="Stop API", command=self._stop_api).pack(side="left", padx=6)
         ctk.CTkButton(api, text="Open Swagger", command=self._open_swagger).pack(side="left", padx=6)
@@ -1391,6 +1396,8 @@ class SimianApp(ctk.CTk):
         mic.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
         self.lbl_mic = ctk.CTkLabel(mic, text="Mic listener: stopped")
         self.lbl_mic.pack(side="left", padx=8)
+        self.badge_mic = StatusBadge(mic, label="Mic", status="unknown")
+        self.badge_mic.pack(side="left", padx=(4, 8))
         ctk.CTkButton(mic, text="Start listener", command=self._start_mic_listener).pack(side="left", padx=6)
         ctk.CTkButton(mic, text="Stop listener", command=self._stop_mic_listener).pack(side="left", padx=6)
 
@@ -1456,21 +1463,30 @@ class SimianApp(ctk.CTk):
                     if out_path:
                         self.log(f"[Services] Output saved: {out_path}")
                         if path.endswith("/tts"):
-                            threading.Thread(target=self._play_audio_file, args=(out_path,), daemon=True).start()
+                            self.task_runner.start_background(self._play_audio_file, out_path)
             except Exception as e:
                 self.after(0, lambda e=e: self._set_services_output(f"Error calling {path}: {e}"))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.task_runner.start_background(worker)
 
     def _poll_status(self) -> None:
-        self.lbl_api.configure(text=f"API: {'running' if port_in_use(DEFAULT_API_HOST, DEFAULT_API_PORT) else 'stopped'}")
+        api_running = port_in_use(DEFAULT_API_HOST, DEFAULT_API_PORT)
+        self.lbl_api.configure(text=f"API: {'running' if api_running else 'stopped'}")
+        self.badge_api.set_status("ok" if api_running else "degraded")
+
         listener = getattr(self, "mic_listener", None)
         if listener is not None and getattr(listener, "is_running", lambda: False)():
-            self.lbl_mic.configure(text="Mic listener: running")
+            mic_text = "Mic listener: running"
+            mic_state = "ok"
         elif MicListenerService is None or self._resolve_vosk_model_dir() is None:
-            self.lbl_mic.configure(text="Mic listener: unavailable")
+            mic_text = "Mic listener: unavailable"
+            mic_state = "degraded"
         else:
-            self.lbl_mic.configure(text="Mic listener: stopped")
+            mic_text = "Mic listener: stopped"
+            mic_state = "unknown"
+        self.lbl_mic.configure(text=mic_text)
+        self.badge_mic.set_status(mic_state)
+
         self._sync_chat_mic_controls()
         self.after(1800, self._poll_status)
     def _start_api(self) -> None:
