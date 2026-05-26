@@ -8,11 +8,628 @@ P4 future intelligence). Each task has: **title**, **priority**,
 Format is plain markdown so it can be pasted into Flourishin's import
 UI or read raw by the team while a native importer is offline.
 
-Last updated: 2026-04-25 (Pass S).
+Last updated: 2026-04-26 (Pass V).
 
 ---
 
-## Pass S — STT accuracy + local-clock grounding (latest, paste at top of Flourishin)
+## Pass V — Replay audio quality + desktop audio upgrade (latest, paste at top of Flourishin)
+
+User report after Pass U: video, mic mux, STT, TTS and theme are all
+stable. Two rough edges remain:
+
+1. **Mic clip audio is quiet and noisy.** The export now contains an
+   audio track but speech sits ~ -22 dBFS with audible room hiss. The
+   user wants it both louder and cleaner without having to fiddle
+   with system mic levels.
+2. **Desktop audio is still hit-or-miss.** WASAPI loopback support
+   varies by sounddevice build, Stereo Mix is disabled by default on
+   Win11, and we never told the user *which* path actually works on
+   their hardware.
+
+Strict rules from prior passes hold: snapshot/mux untouched, GUI /
+theme / STT / replay video pipeline untouched, surgical patches only.
+
+### Root cause summary
+
+1. **No mic preprocessing.** The fallback recorder writes raw PCM to
+   WAV; the export step muxes that WAV verbatim. Anything quieter
+   than the AAC codec's noise floor stays quiet, and any low-level
+   hum gets carried through unchanged.
+2. **No AV duration check.** The Pass U mux uses ``-shortest`` which
+   already prevents a long trailing audio tail, but nothing measured
+   the actual drift -- so when ffprobe reported a 12.0s video and a
+   12.7s mic WAV the operator had no way to know whether ``-shortest``
+   was working correctly or whether the mic was capturing into the
+   future.
+3. **No structured desktop-audio strategy.** ``pick_best_system_audio_choice``
+   returned a single string sentinel; there was no "what paths exist
+   and which one am I using" summary anywhere in the logs. Users
+   without VB-Cable / Stereo Mix had to grep ``WASAPI loopback not
+   supported`` and infer the rest.
+4. **Diagnostics scattered across the log.** dshow enum, sounddevice
+   list, mic auto-pick, WASAPI probe, and rung-fallback all logged
+   from different code paths at different times. Operator had to
+   stitch them together by hand.
+5. **Final-export log lacked metadata.** Pass U-B verified an audio
+   stream exists; Pass V wants codec / sample rate / channels /
+   duration in the same line so the operator can spot wrong-format
+   audio (e.g. 16 kHz mono when the mux expected 44.1 kHz) before
+   the file even plays.
+
+### Task A — Mic normalize + noise gate
+
+`services/audio_fallback_recorder.py` adds a top-level
+``preprocess_mic_wav(src, log_cb)`` returning
+``(out_path, gate_applied, norm_applied, peak_before, peak_after)``.
+
+* **Gate.** Envelope-followed (one-pole IIR, alpha=0.99 ≈ 10 ms attack/
+  release) with a soft knee from ``GATE_FLOOR=0.012`` (~ -38 dBFS) to
+  ``2*GATE_FLOOR``. Below the floor, gain drops to
+  ``GATE_ATTEN=0.15`` (~ -16 dB) -- audible enough that the gate
+  doesn't sound like a hard mute, low enough to mask room hiss.
+  Skipped entirely when the input peak is below 1.5× the gate floor
+  (no real signal to preserve).
+* **Normalize.** Single linear gain to ``NORM_TARGET=0.95``
+  (~ -0.45 dBFS), bounded by ``NORM_MIN_PEAK=0.04`` (don't amplify
+  the noise floor of an empty room) and ``NORM_MAX_PEAK=0.85``
+  (already loud enough; avoid clipping).
+* **Failure mode.** Any exception returns the source path unchanged
+  with both flags False. The original WAV is never overwritten so
+  snapshot rotation can't race the preprocessor.
+* **Log line.** Single contiguous line per call:
+  ``[ReplayAudio] mic preprocess: gate=on, normalize=on; peak_before=0.10, peak_after=0.95 -> <stem>_processed.wav``
+
+`services/replay_buffer.export_last` calls ``preprocess_mic_wav``
+right before the mux step and uses the returned processed path when
+either pass actually ran. The summary log line
+(``Mic preprocess summary: gate=..., normalize=..., peak_before=..., peak_after=...``)
+fires unconditionally so the operator can confirm the preprocessing
+ran every time.
+
+### Task B — AV duration drift check
+
+* `_probe_media_duration(ffmpeg, path)` uses ffprobe (with the same
+  bundled-vs-PATH resolution as the audio probe) to get container
+  duration in seconds.
+* `export_last` probes the post-concat video and the (possibly
+  preprocessed) mic WAV and logs:
+    - ``[ReplayAudio] AV duration drift: video=Xs mic=Ys drift=Zs.
+       ffmpeg -shortest will trim trailing audio so the clip stays
+       in sync; video is never cut.`` (drift > 0.75s)
+    - ``[ReplayAudio] AV duration check: video=Xs mic=Ys drift=Zs
+       (within 0.75s).`` (drift ≤ 0.75s)
+* The mux command already had ``-shortest``; Pass V leaves it in
+  place. Video is never cut.
+
+### Task C — Desktop audio strategy detection
+
+`services/audio_devices.py` adds:
+
+* `_wasapi_loopback_supported()` -- introspects
+  ``WasapiSettings.__init__`` for the ``loopback`` parameter without
+  opening a stream.
+* `detect_desktop_audio_strategy()` -- returns a structured dict
+  with ``stereo_mix``, ``what_u_hear``, ``vb_cable``,
+  ``wasapi_loopback``, ``available`` (ordered list, most reliable
+  first), ``preferred``, and ``diagnostic_message``. The message
+  spells out the install/enable steps when nothing works:
+  ``Desktop audio unavailable: install/enable Stereo Mix (Windows
+  Sound -> Recording -> right-click -> Show Disabled Devices ->
+  enable 'Stereo Mix') or install VB-Cable
+  (https://vb-audio.com/Cable/). Mic audio will still record.``
+* Ordering: VB-Cable / VAC > Stereo Mix > What U Hear > WASAPI
+  loopback. WASAPI is last because its build-version dependency
+  makes it the path most likely to disappear silently after a
+  sounddevice upgrade.
+
+Mic capture is **completely independent** of desktop strategy --
+the mic preprocessing path doesn't even reference the desktop probe,
+so the user keeps mic audio when the desktop path is unavailable.
+
+### Task D — Replay-start device diagnostics block
+
+New `_emit_device_diagnostics()` method on `ReplayBufferRecorder` runs
+at the very top of `start()` and emits one bracketed log block:
+
+```
+[ReplayAudio] Device diagnostics start
+[ReplayAudio]   dshow audio: <name>            (one line per device)
+[ReplayAudio]   sounddevice in [N]: <name> *default
+[ReplayAudio]   sounddevice out[N]: <name> *default
+[ReplayAudio]   selected mic (auto-pick): '<name>' (sd index N)
+[ReplayAudio]   blocked from auto-pick: <comma-separated names>
+[ReplayAudio]   desktop strategy: preferred='<name>'; available=[...]
+[ReplayAudio] Device diagnostics end
+```
+
+Best-effort: each sub-call is wrapped so a missing dependency
+(sounddevice not installed, dshow enum failure, etc.) leaves the
+block in a parseable state with a "(none)" / "enumeration failed"
+sub-line instead of derailing replay startup.
+
+### Task E — ffprobe export verification with full metadata
+
+`_probe_final_audio_stream` now returns
+``(has_audio, codec, samplerate, channels, duration)``. The final
+verification log line spells everything out:
+
+* Success with one source:
+  ``[Replay] Final exported streams verified: video + mic (codec=aac, sr=44100Hz, ch=1, dur=12.45s).``
+* Success with both sources:
+  ``[Replay] Final exported streams verified: video + mic + desktop (codec=aac, sr=44100Hz, ch=2, dur=12.45s).``
+* Audio missing despite intent:
+  ``[Replay] Audio skipped at export: ffprobe confirms final MP4 has NO audio stream despite the mux step succeeding. Likely causes: ...``
+* Plain video:
+  ``[Replay] Final exported streams verified: video only.``
+
+Backwards compatibility note: Pass U callers that unpacked
+``(has_audio, codec)`` need to switch to the 5-tuple. Inside the repo
+the only caller is `export_last`, already updated. The Pass U harness
+got a tiny tuple-unpack widening so it stays a regression baseline.
+
+### Test checklist (synthetic harness)
+
+`_pass_v_harness.py` exercises seven flows in isolation -- no GUI,
+no real audio devices:
+
+1. `preprocess_mic_wav` on a quiet (peak=0.10) tone WAV: must return
+   a sibling processed WAV with peak ≥ 0.94, gate=on, normalize=on.
+2. `preprocess_mic_wav` on a silence WAV: must return the source
+   path unchanged with both flags False.
+3. `preprocess_mic_wav` on a loud (peak=0.95) tone WAV: must skip
+   normalization (gate may still run for hiss removal but is a
+   no-op above the floor).
+4. `detect_desktop_audio_strategy` with synthetic dshow + sd device
+   lists: must rank VB-Cable above Stereo Mix and emit a setup hint
+   when neither is present.
+5. `_probe_final_audio_stream` against a real ffmpeg-muxed MP4: must
+   return ``(True, "aac", 44100, 1, ~1.0)``.
+6. `_probe_media_duration` agrees with `wave` for a known WAV.
+7. `_emit_device_diagnostics` produces a single bracketed block with
+   start/end markers and a "blocked from auto-pick" line listing
+   Microsoft Sound Mapper.
+
+All seven pass against bundled `ffmpeg 4.4.2 + ffprobe 4.4.2`. On
+the user's Windows box they run against bundled FFmpeg 7.1.1.
+
+### Test checklist (real Windows runtime)
+
+For Alex on the live machine:
+
+1. Say "simian clip that".
+2. Confirm the exported MP4 plays.
+3. Confirm mic voice is louder + cleaner than pre-Pass V (compare
+   against any clip from the Pass U era).
+4. ``grep "snapshot rotating"`` in the log -- one line per export.
+5. ``grep "Final exported streams verified"`` -- must list video +
+   mic and a codec/sr/ch/dur tuple.
+6. ``grep "Device diagnostics"`` -- check the desktop strategy line:
+   either it lists at least one path (VB-Cable / Stereo Mix /
+   WASAPI), or it shows the "Desktop audio unavailable: install/
+   enable..." setup hint.
+
+### Risks + follow-ups
+
+* **Gate over-attenuation in noisy rooms.** The current
+  ``GATE_ATTEN=0.15`` (-16 dB) is mild. If the user hears the gate
+  pumping or hears it cut consonants, expose ``GATE_ATTEN`` and
+  ``GATE_FLOOR`` as Settings entries. Out of scope for V; in scope
+  for W if it actually annoys them.
+* **Two-pass amplitude analysis.** Preprocessing currently does a
+  single pass over the WAV (load, gate, normalize, write). On
+  long recordings (15+ minutes) the load step is the dominant cost.
+  Acceptable for "clip that" use cases (typically <60s). Pass W
+  could stream-process if the user wants longer clip limits.
+* **VB-Cable autoinstall.** Out of scope. Pass V surfaces the install
+  hint clearly enough for Alex to act on, but we don't try to
+  download/install VB-Cable for them.
+* **Stereo desktop capture.** When desktop comes via a stereo path
+  and mic is mono, amix downmixes to mono. If the user wants the
+  desktop track preserved as stereo and the mic centered, we'd need
+  a separate filter graph (`amerge` + `pan`). Out of scope for V;
+  flag it for W if the dual-source case becomes common.
+
+---
+
+## Pass U — Replay buffer audio capture + muxing (paste at top of Flourishin)
+
+User report after Pass T: voice UX is solid (wake grace + junk gate +
+route labels all working), but exported replay clips are still silent.
+The runtime log line ``[Replay] Final exported streams: video (1
+input)`` is the smoking gun -- the recorder thinks audio is being
+captured but the export ladder can never see a finalized WAV, so every
+clip ships without mic audio (and without desktop audio when
+``WASAPI`` loopback is unsupported, which is most stock Win11 boxes).
+
+Strict rules: GUI/theme/STT/replay video pipeline are untouched. Pass
+U is **surgical** patches across exactly two service files
+(``audio_fallback_recorder.py`` and ``replay_buffer.py``) -- no
+rewrite of either, no new modules, no schema changes.
+
+### Root cause summary
+
+1. **Snapshot gap.** ``ReplayBufferRecorder._last_fallback_paths`` was
+   populated only by ``stop()``. ``export_last`` runs while the buffer
+   is *still recording*, so it always saw ``None`` and produced a
+   video-only clip even when the fallback recorder was actively
+   writing to ``audio_mic_*.wav``. Fix: a new
+   ``AudioFallbackRecorder.snapshot()`` method that finalizes the
+   in-flight WAV (so ffmpeg can demux it) and immediately re-arms a
+   fresh capture window. Same-millisecond rotation is safe because
+   the timestamp helper uses ``datetime.now().strftime("%f")``
+   (microsecond precision).
+
+2. **time.strftime ``%f`` was a no-op.** The previous timestamp logic
+   was ``time.strftime("%Y%m%d_%H%M%S_%f")[:-3]``, which the C library
+   leaves as a literal ``%f`` -- two starts in the same wall-clock
+   second produced identical filenames. Replaced with a
+   ``_ts_with_micros()`` helper using ``datetime`` so snapshot's
+   stop+start cycle always rotates to a fresh path.
+
+3. **No probe of the final MP4.** The export step logged what it
+   *intended* to mux (``video + fallback-mic``) but never verified
+   the result. If amix dropped a zero-length WAV or ``-shortest``
+   clipped audio to zero, the clip silently shipped silent. Fix:
+   ``ReplayBufferRecorder._probe_final_audio_stream`` runs ``ffprobe``
+   (or falls back to ``ffmpeg -i`` parsing) against the exported MP4
+   and logs ``Final exported streams verified by ffprobe: video +
+   audio (codec=aac)`` on success, or a loud failure line on regress.
+
+4. **Bad device picks broke fallback capture.** PortAudio defaults
+   would happily route through ``Microsoft Sound Mapper - Input``,
+   ``Stereo Mix``, ``PC Speaker``, or a ``Bluetooth Hands-Free``
+   profile -- all noise floors or off-device. Fix:
+   ``pick_best_mic_device`` scores by host API
+   (WASAPI > DirectSound > MME), boosts names containing
+   "microphone", honors ``sd.default.device`` as a tiebreaker, and
+   refuses any device whose name matches the
+   ``MIC_AUTOPICK_BLOCKLIST``. Companion ``list_alt_mic_devices``
+   returns retry candidates (also blocklist-filtered) so the capture
+   loop walks past silent devices on its own without operator
+   intervention.
+
+### Task A — WAV health log + silent-device retry
+
+* ``audio_fallback_recorder.py`` instruments each capture loop with
+  numpy peak tracking. ``_capture_loop`` now returns
+  ``Tuple[int, float]`` (frames written, peak amplitude) and the
+  outer ``_capture_loop_runner`` logs ``[ReplayAudio] WAV health ->
+  path=..., duration=2.31s, samplerate=44100, peak=0.142, size=...
+  bytes.``
+* When peak < ``SILENCE_PEAK_THRESHOLD`` (≈ -46 dBFS) or 0 frames
+  were written, the loop walks ``list_alt_mic_devices`` and retries
+  with a fresh WAV path per attempt. Each retry logs the device
+  decision so an operator can grep for ``Retrying mic capture on
+  device``.
+* Silent-WAV warning fires once: ``[ReplayAudio] WAV looks silent
+  after capture (peak < threshold). Continuing anyway -- mux step
+  will probe the final MP4.``
+
+### Task B — Export muxing + ffprobe verification
+
+* ``replay_buffer.export_last`` calls ``fb.snapshot()`` when the
+  fallback recorder is running so the exporter sees finalized WAVs
+  for the segment window being clipped. Falls back to
+  ``_last_fallback_paths`` (only useful after ``stop()``) when
+  snapshot raises.
+* New ``Mux inputs ready: mic=..., desktop=...`` log immediately
+  before the mux command, and ``Audio skipped at export: <reason>``
+  when no audio sources were present (with the specific reason --
+  "fallback recorder produced no usable WAV (silent or empty after
+  all retries)" vs. "no audio fallback was armed (ffmpeg/dshow rung
+  succeeded with audio, or user did not request audio)").
+* New ``_probe_final_audio_stream`` helper runs ffprobe (preferring
+  the sibling ``ffprobe.exe`` next to the resolved ``ffmpeg``) and
+  logs the verified outcome:
+    - ``Final exported streams verified by ffprobe: video + audio (codec=aac).``
+    - ``Final exported streams verified by ffprobe: video only.``
+    - ``Audio skipped at export: ffprobe confirms final MP4 has NO
+       audio stream despite the mux step succeeding`` (the loud
+       regression line, with three diagnostic causes for the
+       operator).
+
+### Task C — Desktop audio resilience
+
+The fallback's desktop-loopback path stays best-effort: WASAPI
+loopback only works on certain ``sounddevice`` builds, so when the
+attempt raises we now log ``[ReplayAudio] Desktop loopback
+unavailable on this sounddevice build; clip will export with mic
+audio only.`` instead of silently falling through. No VB-Cable
+auto-install scaffolding -- that's a Pass V item if the user wants
+it.
+
+### Task D — Smart mic device selection
+
+* ``MIC_AUTOPICK_BLOCKLIST`` blocks Microsoft Sound Mapper,
+  ``Primary Sound Capture Driver``, ``Stereo Mix``, ``PC Speaker``,
+  Bluetooth Hands-Free, ``What U Hear``, and ``Wave Out Mix``. These
+  are noise floors or off-device routes that PortAudio has been
+  observed to pick when nothing else is wired.
+* ``pick_best_mic_device`` scoring (higher is better):
+    - +30 WASAPI, +20 DirectSound, +5 MME (everything else 0).
+    - +15 if name contains "microphone".
+    - +10 if device matches ``sd.default.device[0]``.
+    - +2 per input channel (cap 4) so a stereo headset beats a
+      mono variant of the same physical device.
+* ``list_alt_mic_devices(skip_index, log_cb)`` returns blocklist-
+  filtered candidates ordered by the same score, so the silent-WAV
+  retry walks them deterministically.
+
+### Task E — STT pause/resume around fallback (verified intact)
+
+Already wired in Pass R-C; Pass U confirms the snapshot rotation
+does **not** double-trigger pause/resume. The pause flag
+(``_stt_was_paused_for_fallback``) is owned by
+``ReplayBufferRecorder``, set once when the screen-only rung arms
+the fallback, cleared once when ``ReplayBufferRecorder.stop()``
+runs. ``snapshot()`` calls ``fb.stop()`` and ``fb.start()`` on the
+inner ``AudioFallbackRecorder`` only -- it never touches the outer
+pause flag, so STT stays paused for the entire fallback lifetime
+and is resumed exactly once.
+
+### Test checklist (synthetic harness)
+
+The Pass U synthetic harness (``_pass_u_harness.py``) exercises four
+flows in isolation -- no GUI, no real audio devices:
+
+1. ``pick_best_mic_device`` scoring against a synthetic device list:
+   the WASAPI Realtek mic must beat the Sound Mapper, Sound Mapper /
+   Stereo Mix / Bluetooth HF must NOT appear in
+   ``list_alt_mic_devices``, and the USB Headset mic must.
+2. ``AudioFallbackRecorder.snapshot()``: stop + start must rotate the
+   WAV path (verified by filename diff) and must preserve the
+   original (mic_wanted, desktop_wanted) flags.
+3. ``ReplayBufferRecorder._mux_fallback_audio`` against a real ffmpeg
+   black-video MP4 + tone WAV: must produce an MP4 that ffprobe
+   reports as containing an AAC audio stream.
+4. ``ReplayBufferRecorder._probe_final_audio_stream`` must return
+   ``False`` for the silent input video and ``True`` for the muxed
+   output -- proves the probe is the ground truth, not the input
+   intent.
+
+All four pass on the current sandbox (`ffmpeg 4.4.2`, `ffprobe
+4.4.2`); on the user's Windows box they run against bundled FFmpeg
+7.1.1 in ``ffmpeg-7.1.1/bin/``.
+
+### Risks + follow-ups
+
+* **WASAPI loopback API drift.** ``sounddevice`` 0.5.5 added the
+  loopback flag we rely on; older builds will silently fall through
+  to mic-only. Pass U logs this explicitly so the user can pin a
+  newer wheel; auto-install is out of scope.
+* **Snapshot audio gap.** Stop+start typically gaps ≈200-300 ms of
+  audio while PortAudio reopens the device. Acceptable for an
+  on-demand "clip that" trigger; intolerable for a continuous
+  recording flow. Future Pass V could mitigate with a ring-buffer
+  WAV writer, but only if the audio gap actually annoys the user.
+* **VB-Cable / VAC autoinstall.** Out of scope. If the user wants
+  reliable desktop-loopback even on hardware where WASAPI loopback
+  doesn't work, install a VB-Cable virtual device and pick it as the
+  default playback. Pass U logs surface the missing-loopback case
+  clearly enough to act on.
+
+---
+
+## Pass T — Voice UX refinement + routing confidence (paste at top of Flourishin)
+
+User report after Pass S: STT, alias normalization, local-clock
+grounding, voice-triggered "clip that", replay export, and the
+GUI/TTS/theme are all stable. Three remaining UX rough edges:
+
+1. **Wake mode is too strict after wake-acknowledge.** User says
+   "a simian", Simian replies "I'm listening", user says "what
+   time is it" -- the listener rejects it because it lacks the wake
+   word. The conversation feels broken; the user has to keep saying
+   "simian" before every utterance even though the assistant
+   *just* said "I'm listening".
+2. **Vosk produces junk/noise transcripts.** Specific examples
+   captured from the live log: "four girls ran to my head", "love
+   for dan", "amazon basin". These should never reach chat.
+3. **Routing logs are hard to scan.** Every accept/reject path
+   already logs *something* (since Pass R-D), but the user has to
+   read the surrounding context to figure out which conceptual
+   route fired. They asked for explicit ``[Voice] Route: <LABEL>``
+   lines so a single grep tells them the disposition.
+
+Strict rules from prior passes hold: no GUI redesign, theme / TTS /
+replay buffer untouched, ``mic_listener.py`` is patched not rewritten.
+
+### Root cause summary
+
+1. **No conversational continuity primitive.** Pass S-B added a
+   synthetic ``wake_acknowledge`` command for bare wake utterances
+   ("hey simian" -> "I'm listening"), but the listener immediately
+   reverted to "wake word required" mode for the next utterance.
+   There was no concept of a "follow-up grace window" carried over
+   from the ack.
+2. **No confidence/junk gate.** ``_handle_text`` filtered only the
+   tiniest cases (``IGNORE_UTTERANCES`` -- "huh"/"uh"/"um"…) and
+   relied on the wake-word check to drop everything else. Hot-mic
+   mode and the new grace window both bypass that check, so junk
+   from background TV / silence / mishears could leak through.
+3. **Mixed accept/reject log lines, no canonical labels.** The Pass
+   R-D logs mention "rejected (no wake)", "rejected (duplicate
+   within 2s)", "rejected (ignore-utterance)", etc. -- all useful,
+   but the user wanted a stable, parseable label for the *route*
+   decision. Adding the labels also forced us to think about each
+   path one more time, which is how the grace-vs-junk-filter ordering
+   got nailed down.
+
+### Tasks A — Wake grace window (5 seconds, extend on every accept)
+
+`services/mic_listener.py` adds the grace primitive. Three pieces:
+
+* New constant ``WAKE_GRACE_SEC = 5.0`` (top of file, near
+  ``WAKE_LEADING_FILLER``).
+* New instance state ``self._wake_grace_until: float = 0.0`` (in
+  ``__init__``). Cleared on ``stop()`` and on hot-mode toggle so a
+  stale window cannot leak across sessions.
+* Three new methods:
+    - ``_in_wake_grace()`` -- returns True if the timer is in the
+      future. Crossing the expiry boundary logs
+      ``[Voice] Wake grace expired`` exactly once and resets the
+      timer to 0.0 so we never spam the log.
+    - ``open_wake_grace(seconds=5.0)`` -- starts a fresh window and
+      logs ``[Voice] Wake grace opened: 5s``.
+    - ``extend_wake_grace(seconds=5.0)`` -- resets the window if one
+      is currently open (no-op if not). Used by the GUI after
+      every successful follow-up so a chain of commands keeps the
+      conversational thread alive without re-prompting.
+
+`_extract_after_wake` now takes ``in_grace: bool = False`` and
+treats a true grace flag the same way it treats hot-mode: wake word
+becomes optional. ``_handle_text`` consults
+``self._in_wake_grace()`` once per utterance and:
+
+* Logs ``[Voice] Wake grace accepted: <text>`` whenever the grace
+  flag was the reason a non-wake-word utterance landed as a command.
+* Lets the existing ``wake_acknowledge`` path emit a route label
+  (``[Voice] Route: WAKE_ACK``) which the GUI then uses as the
+  trigger to call ``open_wake_grace()``.
+
+`gui/simian_gui.py` adds two thin wrappers, ``_open_voice_grace``
+and ``_extend_voice_grace``. The ``_on_voice_command`` handler
+calls ``_open_voice_grace`` exactly once -- on
+``wake_acknowledge`` -- and ``_extend_voice_grace`` after every
+other accepted voice command (clip, buffer_start/stop, screen_*).
+The transcript handler ``_on_voice_transcript`` extends the grace
+after both LOCAL_TIME and CHAT routes.
+
+### Tasks B — Junk transcript filter
+
+New constants in ``services/mic_listener.py``:
+
+* ``VALID_SHORT_COMMANDS`` -- explicit allow-list ("clip that",
+  "stop", "cancel", "yes", "no", "ok", "okay", "pause", "resume",
+  "exit", "quit") so a one-word command never gets filtered as a
+  fragment.
+* ``JUNK_HALLUCINATIONS`` -- compiled regex with the three concrete
+  user-observed phrases ("four girls ran to my head", "love for
+  dan", "amazon basin"). Open list -- extend whenever the field
+  log surfaces a new hallucination.
+
+New helper ``_is_junk(text)`` returns True if the text is empty,
+matches a known hallucination, or is a single token shorter than
+3 chars. The allow-list is consulted first so "stop"/"yes"/"no"
+never trip the length heuristic.
+
+The filter runs **twice** in ``_handle_text``:
+
+* First pass against the full normalized utterance, *only* if no
+  ``COMMAND_PATTERNS`` regex matches first. This kills "four girls
+  ran to my head" before any wake-word logic runs.
+* Second pass against the post-wake-strip ``spoken`` text. This
+  catches the case where Vosk attaches a hallucination to a real
+  wake word ("simian amazon basin") -- after stripping "simian" the
+  surviving "amazon basin" is junked.
+
+Rejection emits ``[Voice] Rejected: low_confidence/junk transcript: <text>``
+and the route label ``[Voice] Route: REJECTED_LOW_CONFIDENCE``.
+
+### Tasks C — Route labels
+
+Six labels, exactly as specified, all logged with the prefix
+``[Voice] Route: ``:
+
+* ``WAKE_ACK`` -- emitted in ``_handle_text`` when a bare-wake
+  utterance is about to fire ``wake_acknowledge``.
+* ``LOCAL_TIME`` -- emitted GUI-side in ``_on_voice_transcript``
+  when ``local_clock.maybe_answer`` matches; the GUI replies
+  directly without calling Ollama.
+* ``CLIP`` -- emitted in ``_handle_text`` when the ``clip`` regex
+  fires. Other command patterns log ``COMMAND/<name>`` so they
+  remain greppable but do not pretend to be the headline route.
+* ``CHAT`` -- emitted GUI-side in ``_on_voice_transcript`` for any
+  transcript that isn't a local-clock query.
+* ``REJECTED_NO_WAKE`` -- emitted in ``_handle_text`` when wake-word
+  mode received an utterance with no wake word and the grace
+  window was closed.
+* ``REJECTED_LOW_CONFIDENCE`` -- emitted at every junk/length/empty
+  rejection site (both pre- and post-strip).
+
+### Task D — Preserve Pass S
+
+Verified by direct grep: ``SIMIAN_ALIASES`` regex unchanged,
+``_strip_filler`` unchanged, ``_extract_after_wake`` still strips
+the wake phrase before returning, ``services.local_clock``
+unchanged, ``model_context_block()`` still prepended to the Ollama
+prompt in ``_send_chat``'s worker. Pass T only adds new code paths;
+it does not remove any Pass S logic.
+
+### Task E — Test checklist (all passed)
+
+Verified with a Python harness that loads ``mic_listener.py`` and
+``local_clock.py`` directly via ``importlib.util`` (services
+package import requires httpx which isn't in the sandbox). Stubs
+``sounddevice`` and ``vosk`` so the listener instantiates.
+
+1. **Wake mode follow-up.** ``_handle_text("a simian")`` -> emits
+   ``Route: WAKE_ACK`` and the ``wake_acknowledge`` command;
+   ``open_wake_grace()`` opens 5s window and logs accordingly;
+   ``_handle_text("what time is it")`` lands as
+   ``Wake grace accepted`` and ``local_clock.maybe_answer``
+   produces a real answer ("It's 12:27 PM."). ✅
+2. **Junk filter.** All three observed hallucinations
+   ("four girls ran to my head", "love for dan", "amazon basin")
+   route to ``REJECTED_LOW_CONFIDENCE`` with the expected reason
+   line; ``transcript_cb`` is never called for any of them. ✅
+3. **simeon clip that.** Alias normalizes to "simian clip that",
+   command pattern matches, route logs ``CLIP``, ``command_cb``
+   fires with ``cmd="clip"``. ✅
+4. **Hot mic time query.** Listener mode set to hot mic;
+   ``_handle_text("what time is it")`` queues a transcript without
+   needing a wake word; ``local_clock.maybe_answer`` answers from
+   the GUI side. ✅
+5. **Route labels visible.** Combined harness emits ``REJECTED_NO_WAKE``,
+   ``WAKE_ACK``, ``CLIP``, ``REJECTED_LOW_CONFIDENCE`` in expected
+   order; grace expiry logs once after a 0.5s window; "stop" alone
+   is not junked during grace. ✅
+
+### Files changed in Pass T
+
+* ``services/mic_listener.py`` -- added ``WAKE_GRACE_SEC``,
+  ``VALID_SHORT_COMMANDS``, ``JUNK_HALLUCINATIONS``, the
+  ``_wake_grace_until`` instance attr, the three grace methods,
+  ``_is_junk``, the route-label log lines, ``in_grace`` parameter on
+  ``_extract_after_wake``. Restored Pass S behaviors untouched.
+* ``gui/simian_gui.py`` -- ``_on_voice_command`` opens grace on
+  ``wake_acknowledge`` and extends on every other command;
+  ``_on_voice_transcript`` adds a LOCAL_TIME early-intercept that
+  short-circuits to ``_chat_reply`` and extends grace; new
+  ``_open_voice_grace`` / ``_extend_voice_grace`` thin wrappers
+  beside the existing pause/resume helpers; ``Route: CHAT`` /
+  ``Route: REJECTED_LOW_CONFIDENCE`` log lines added at the matching
+  branches.
+* ``artifacts/flourishin_simian_backlog.md`` -- this section
+  prepended.
+
+### Risks / follow-ups
+
+* **5s is a guess.** If the user tells us the natural breath
+  between ack and command is longer / shorter, ``WAKE_GRACE_SEC``
+  is one constant to tune (or expose via ``settings_store``).
+* **Junk hallucination list is small on purpose.** The three
+  documented phrases catch the live cases; if more turn up in field
+  logs, append them to ``JUNK_HALLUCINATIONS``. A more general
+  approach would be a Vosk confidence score gate, but that requires
+  a re-train pipeline we don't currently own.
+* **Route: COMMAND/<name> for non-clip commands.** The user spec
+  only required CLIP as a label, but every other command pattern
+  also gets a stable ``COMMAND/<name>`` route line so logs remain
+  uniform. If they prefer the bare names, dropping the prefix is a
+  one-line change.
+* **CHAT route fires even when chat is busy.** The label is logged
+  before the busy check (so it's a "this was the intent" log, not
+  a "this was sent" log). The accept-or-reject log line that
+  follows still tells the truth about whether the chat actually
+  shipped. Could be re-ordered if logs feel misleading.
+* **No telemetry hook yet.** ``services.four_d_telemetry.emit``
+  could publish per-route counts so the 4D Lab tab shows a "voice
+  routing health" widget. Out of scope for Pass T.
+
+---
+
+## Pass S — STT accuracy + local-clock grounding
 
 User report after Pass R: STT is alive and hot mic ships speech to
 chat, but accuracy is poor. Vosk's small en-US model mishears the

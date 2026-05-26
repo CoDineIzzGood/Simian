@@ -1458,6 +1458,7 @@ class SimianApp(ctk.CTk):
         low = spoken.lower()
         if low in {"huh", "uh", "um", "hmm", "mm", "hm"}:
             self.log(f"[Voice] GUI rejected (filler utterance): {spoken}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
             return
         last = getattr(self, "_last_voice_text", "")
         last_ts = float(getattr(self, "_last_voice_ts", 0.0) or 0.0)
@@ -1468,14 +1469,47 @@ class SimianApp(ctk.CTk):
         self._last_voice_text = spoken
         self._last_voice_ts = now
 
+        # Pass T-C: classify the route BEFORE handing off so the log
+        # shows LOCAL_TIME / CHAT before any model call. The local-clock
+        # check is a regex (cheap) -- doing it here means a follow-up
+        # like "what time is it" lands in <50ms even when the listener
+        # currently has a chat-busy spinner up against Ollama.
+        try:
+            from services.local_clock import maybe_answer as _local_clock_answer
+        except Exception as exc:
+            self.log(f"[Time] local_clock import failed ({exc}); falling through.")
+            _local_clock_answer = None  # type: ignore[assignment]
+        local_answer: Optional[str] = None
+        if _local_clock_answer is not None:
+            try:
+                local_answer = _local_clock_answer(spoken)
+            except Exception as exc:
+                self.log(f"[Time] maybe_answer raised ({exc}); routing to chat.")
+                local_answer = None
+
         def apply_transcript() -> None:
+            if local_answer:
+                # Pass T-C: LOCAL_TIME route. Skip the LLM entirely; the
+                # answer is system-clock truth. Still extends grace so
+                # the user can keep talking after the time/date reply.
+                self.log(f"[Voice] Route: LOCAL_TIME -> {spoken}")
+                self.log("[Time] Answered from local system clock")
+                self._chat_append("You", spoken)
+                self._remember_chat("user", spoken)
+                self._chat_reply(local_answer)
+                self._extend_voice_grace()
+                return
             if self._chat_inflight:
                 self.log(f"[Voice] GUI rejected (chat busy): {spoken}")
                 return
+            self.log(f"[Voice] Route: CHAT -> {spoken}")
             self.log(f"[Voice] GUI accepted transcript -> chat: {spoken}")
             self.chat_entry.delete(0, "end")
             self.chat_entry.insert(0, spoken)
             self._send_chat()
+            # Pass T-A: extend the follow-up window so a quick chain
+            # (chat -> "clip that" -> "what time is it") stays in grace.
+            self._extend_voice_grace()
 
         self.after(0, apply_transcript)
 
@@ -4051,21 +4085,30 @@ class SimianApp(ctk.CTk):
             self.after(0, lambda: self.extra_entry.delete(0, "end"))
             self.after(0, lambda: self.extra_entry.insert(0, str(extra)))
             self.after(0, self._export_clip)
+            # Pass T-A: keep the conversational thread alive after a
+            # successful follow-up command so the user can chain
+            # "clip that" -> "what time is it" without re-saying simian.
+            self._extend_voice_grace()
         elif cmd == "buffer_start":
             self.log(f"[Voice] GUI accepted command: buffer_start (raw='{raw}')")
             self.after(0, self._start_replay_buffer)
+            self._extend_voice_grace()
         elif cmd == "buffer_stop":
             self.log(f"[Voice] GUI accepted command: buffer_stop (raw='{raw}')")
             self.after(0, self._stop_replay_buffer)
+            self._extend_voice_grace()
         elif cmd == "screen_look":
             self.log(f"[Voice] GUI accepted command: screen_look (raw='{raw}')")
             self.after(0, self._voice_screen_look)
+            self._extend_voice_grace()
         elif cmd == "screen_pause":
             self.log(f"[Voice] GUI accepted command: screen_pause (raw='{raw}')")
             self.after(0, self._voice_screen_pause)
+            self._extend_voice_grace()
         elif cmd == "screen_resume":
             self.log(f"[Voice] GUI accepted command: screen_resume (raw='{raw}')")
             self.after(0, self._voice_screen_resume)
+            self._extend_voice_grace()
         elif cmd == "wake_acknowledge":
             # Pass S-B: user said the wake word with nothing useful
             # following it. Reply with a short ready/listening line
@@ -4073,9 +4116,49 @@ class SimianApp(ctk.CTk):
             # trip on "hey simian". TTS is wired through _chat_reply
             # already, so this also speaks the response when sound is on.
             self.log(f"[Voice] GUI accepted command: wake_acknowledge (raw='{raw}')")
+            # Pass T-A: open the post-ack follow-up window BEFORE we
+            # speak the ready line, so that if the user starts talking
+            # while TTS is still ramping the listener already has the
+            # grace flag set by the time the next utterance is heard.
+            self._open_voice_grace()
             self.after(0, lambda: self._chat_reply("I'm listening."))
         else:
             self.log(f"[Voice] GUI rejected (unknown command '{cmd}', raw='{raw}')")
+
+    def _open_voice_grace(self) -> None:
+        """Open the 5s post-wake-ack follow-up window on the listener.
+
+        Thin wrapper that tolerates a missing or already-stopped listener
+        without raising; voice commands keep working in test/headless
+        mode where the listener may be stubbed.
+        """
+        listener = getattr(self, "mic_listener", None)
+        if listener is None:
+            return
+        opener = getattr(listener, "open_wake_grace", None)
+        if opener is None:
+            return
+        try:
+            opener()
+        except Exception as exc:
+            self.log(f"[Voice] Wake grace open failed: {exc}")
+
+    def _extend_voice_grace(self) -> None:
+        """Extend the grace window after a follow-up command landed.
+
+        No-ops if the listener has no grace currently open, so a non-voice
+        command path (typing) doesn't accidentally start a grace window.
+        """
+        listener = getattr(self, "mic_listener", None)
+        if listener is None:
+            return
+        extender = getattr(listener, "extend_wake_grace", None)
+        if extender is None:
+            return
+        try:
+            extender()
+        except Exception as exc:
+            self.log(f"[Voice] Wake grace extend failed: {exc}")
     # ----------------------- CLOSE -----------------------
 
     def _on_close(self) -> None:

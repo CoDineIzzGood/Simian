@@ -63,6 +63,36 @@ IGNORE_UTTERANCES = {"huh", "uh", "um", "hmm", "hm", "mm", "oh"}
 # "really" or "now" stay in because they often carry intent.
 WAKE_LEADING_FILLER = {"hey", "ok", "okay", "yo", "please", "a", "the", "uh", "um", "well"}
 
+# Pass T-A: how long the post-wake-acknowledge "follow-up" window stays
+# open. The user said "a simian" -> "I'm listening" -> "what time is
+# it" should land as a follow-up without re-speaking the wake word.
+# 5s is short enough that ambient TV/radio in the background can't
+# accidentally hijack chat for very long, but long enough for a normal
+# breath between the ack and the actual question.
+WAKE_GRACE_SEC = 5.0
+
+# Pass T-B: small allow-list of short commands we never want the junk
+# filter to drop. Vosk often returns these as one or two words and the
+# generic "too short" heuristic would otherwise reject them.
+VALID_SHORT_COMMANDS = {
+    "clip that", "stop", "cancel", "yes", "no", "ok", "okay",
+    "pause", "resume", "exit", "quit",
+}
+
+# Pass T-B: Vosk-prone background hallucinations the user has actually
+# observed in their logs. The list is intentionally small and concrete
+# rather than an open-ended language model: any phrase here is one we
+# already know the small en-US Vosk model invents on silence/noise on
+# this user's box. Extend as we collect more samples in the field.
+JUNK_HALLUCINATIONS = re.compile(
+    r"\b("
+    r"four\s+girls\s+ran\s+to\s+my\s+head"
+    r"|love\s+for\s+dan"
+    r"|amazon\s+basin"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # Pass S-A: widened alias map. Vosk's small en-US model consistently
 # mishears "Simian" as one of these surface forms on the user's box;
 # normalize them before any wake-word / command logic so a 70%-accurate
@@ -149,6 +179,12 @@ class MicListenerService:
         # Surface runtime-truthful startup failures (e.g. stale PortAudio
         # device id) to callers without requiring them to scrape logs.
         self._last_error: Optional[str] = None
+        # Pass T-A: monotonic-ish epoch (time.time()) until which the
+        # wake-word requirement is relaxed. 0.0 means "no grace open".
+        # The GUI calls open_wake_grace() right after we emit a
+        # wake_acknowledge command, and extend_wake_grace() after every
+        # other accepted command. Reading code consults _in_wake_grace().
+        self._wake_grace_until: float = 0.0
 
     def available(self) -> bool:
         return self._available and (_find_vosk_model_dir() is not None)
@@ -196,6 +232,81 @@ class MicListenerService:
         self._paused.clear()
         self.log("[STT] resumed after replay capture")
 
+    # ------------------------------------------------------------------
+    # Pass T-A: wake grace window helpers
+    # ------------------------------------------------------------------
+    def _in_wake_grace(self) -> bool:
+        """True if a post-ack follow-up window is currently open.
+
+        Crossing the expiry boundary logs ``[Voice] Wake grace expired``
+        exactly once -- the flag is reset to 0.0 on the same tick so we
+        do not spam the textbox once per audio callback.
+        """
+        if self._wake_grace_until <= 0.0:
+            return False
+        if time.time() < self._wake_grace_until:
+            return True
+        self._wake_grace_until = 0.0
+        self.log("[Voice] Wake grace expired")
+        return False
+
+    def open_wake_grace(self, seconds: float = WAKE_GRACE_SEC) -> None:
+        """Open a fresh follow-up window. Called by the GUI after it
+        replies "I'm listening" to a wake_acknowledge command. Idempotent:
+        re-opens the same length window if already open.
+        """
+        try:
+            sec = float(seconds)
+        except (TypeError, ValueError):
+            sec = WAKE_GRACE_SEC
+        sec = max(0.5, sec)
+        self._wake_grace_until = time.time() + sec
+        # Format compactly: integer seconds for the common 5s case,
+        # one decimal otherwise (so test 0.5s windows still log clearly).
+        sec_str = f"{int(sec)}s" if abs(sec - int(sec)) < 1e-6 else f"{sec:.1f}s"
+        self.log(f"[Voice] Wake grace opened: {sec_str}")
+
+    def extend_wake_grace(self, seconds: float = WAKE_GRACE_SEC) -> None:
+        """Reset the grace window after an accepted follow-up command.
+        Same effect as open_wake_grace but logged differently so the
+        textbox shows a clear conversational rhythm. If no grace is
+        currently open, this is a no-op (the grace state is opened only
+        after an explicit wake acknowledgement).
+        """
+        if self._wake_grace_until <= 0.0:
+            return
+        try:
+            sec = float(seconds)
+        except (TypeError, ValueError):
+            sec = WAKE_GRACE_SEC
+        sec = max(0.5, sec)
+        self._wake_grace_until = time.time() + sec
+
+    def _is_junk(self, text: str) -> bool:
+        """Pass T-B: lightweight junk/low-confidence gate.
+
+        Returns True if the (already normalized) text should be dropped
+        before routing. The intent is conservative -- we'd rather pass a
+        real command through than drop one. The allow-list of valid short
+        commands runs first so 'stop'/'yes'/'no' never gets mistaken for
+        a one-word fragment.
+        """
+        cleaned = (text or "").strip().lower()
+        if not cleaned:
+            return True
+        if cleaned in VALID_SHORT_COMMANDS:
+            return False
+        # Known Vosk hallucinations from the user's logs.
+        if JUNK_HALLUCINATIONS.search(cleaned):
+            return True
+        # Single-token nonsense fragments under 3 chars (e.g. "ah", "uh",
+        # the letter "k"). The IGNORE_UTTERANCES set already catches the
+        # most common ones; this is a wider net for anything similar.
+        words = cleaned.split()
+        if len(words) == 1 and len(cleaned) < 3:
+            return True
+        return False
+
     def set_hot_mode(self, enabled: bool) -> None:
         prev = self.hot_mode
         self.hot_mode = bool(enabled)
@@ -207,6 +318,10 @@ class MicListenerService:
         if prev != self.hot_mode:
             self._last_text = ""
             self._last_text_ts = 0.0
+            # Pass T-A: any pending grace window from the previous mode
+            # is meaningless in the new mode (hot mic doesn't need it,
+            # and a fresh wake-word session should start cold).
+            self._wake_grace_until = 0.0
         self.log(
             f"[Voice] Listener mode: {'hot mic' if self.hot_mode else 'wake word'}."
         )
@@ -230,6 +345,9 @@ class MicListenerService:
         # eventually reports false. Order matters: set _stop first so
         # the post-pause iteration bails out before reopening the stream.
         self._paused.clear()
+        # Pass T-A: drop any open grace window so the next start() begins
+        # cold without an inherited follow-up timer.
+        self._wake_grace_until = 0.0
         self._cancel_pending_flush()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
@@ -412,19 +530,19 @@ class MicListenerService:
             heard = re.sub(r"\banimation\b", "automation", heard)
         return heard.strip().lower()
 
-    def _extract_after_wake(self, text: str) -> str:
+    def _extract_after_wake(self, text: str, in_grace: bool = False) -> str:
         cleaned = (text or "").strip(" ,.!?-")
         if not cleaned:
             return ""
         wake = (self.config.wake_word or "").strip().lower()
         if not wake:
             return self._strip_filler(cleaned)
-        # Pass S-B: in hot mode, peel a leading "[filler]* simian"
-        # prefix off if present, otherwise treat the whole utterance
-        # as the command. Filler is stripped both before AND after
-        # the wake split so "hey simian please clip that" reduces to
-        # "clip that".
-        if self.hot_mode:
+        # Pass S-B / Pass T-A: in hot mode OR while a post-ack grace
+        # window is open, peel a leading "[filler]* simian" prefix off
+        # if present, otherwise treat the whole utterance as the command.
+        # Filler is stripped both before AND after the wake split so
+        # "hey simian please clip that" reduces to "clip that".
+        if self.hot_mode or in_grace:
             if wake in cleaned:
                 head, _, tail = cleaned.partition(wake)
                 if not self._strip_filler(head):
@@ -516,6 +634,9 @@ class MicListenerService:
         heard = self._normalize_text(text)
         wake = (self.config.wake_word or "").strip().lower()
         had_wake = bool(wake) and wake in heard
+        # Pass T-A: consult grace state ONCE per utterance so the
+        # logging is consistent if the timer happens to expire mid-route.
+        in_grace = self._in_wake_grace()
         if heard != raw:
             self.log(
                 f"[Voice] Normalized: raw='{raw}' -> normalized='{heard}' "
@@ -526,12 +647,22 @@ class MicListenerService:
 
         if not heard:
             self.log(f"[Voice] Rejected (empty after normalize): {text!r}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
             return
         if heard in IGNORE_UTTERANCES:
             self.log(f"[Voice] Rejected (ignore-utterance): {heard}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
             return
         if self._is_duplicate(heard):
             self.log(f"[Voice] Rejected (duplicate within 2s): {heard}")
+            return
+        # Pass T-B: junk/hallucination gate. Runs after dedupe so the
+        # rejection log has a stable reason. Skips for transcripts that
+        # contain a known command pattern (a real "clip that" should
+        # never be killed by a length heuristic).
+        if self._is_junk(heard) and not any(p.search(heard) for p in COMMAND_PATTERNS.values()):
+            self.log(f"[Voice] Rejected: low_confidence/junk transcript: {heard}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
             return
 
         self.log(f"[Voice] Heard: {heard}")
@@ -547,10 +678,23 @@ class MicListenerService:
                 # Pass R-D: explicit accept log so every transcript has
                 # exactly one accepted/rejected line in the GUI textbox.
                 self.log(f"[Voice] Command routed: {name} (raw='{heard}')")
+                # Pass T-C: route label. CLIP gets its own label per the
+                # user's spec; everything else collapses to a generic
+                # COMMAND tag so the log is greppable but uncluttered.
+                if name == "clip":
+                    self.log("[Voice] Route: CLIP")
+                else:
+                    self.log(f"[Voice] Route: COMMAND/{name}")
                 self.command_cb(name, meta)
                 return
 
-        spoken = self._extract_after_wake(heard)
+        spoken = self._extract_after_wake(heard, in_grace=in_grace)
+        # Pass T-A: if grace caught a follow-up that lacked the wake
+        # word, log it explicitly so the conversational handoff is
+        # visible in the textbox.
+        grace_used = bool(spoken) and in_grace and (not had_wake) and (not self.hot_mode)
+        if grace_used:
+            self.log(f"[Voice] Wake grace accepted: {spoken}")
         # Pass S-B: when the wake word fired but nothing meaningful
         # follows ("hey simian", "simian"), don't silently drop -- emit
         # a synthetic 'wake_acknowledge' command so the GUI can play a
@@ -559,6 +703,7 @@ class MicListenerService:
         if not spoken:
             if had_wake and not self.hot_mode:
                 self.log(f"[Voice] Wake-only utterance: {heard}")
+                self.log("[Voice] Route: WAKE_ACK")
                 self._cancel_pending_flush()
                 self.command_cb("wake_acknowledge", {"raw": heard})
                 return
@@ -567,12 +712,24 @@ class MicListenerService:
                 f"[Voice] Rejected (no '{self.config.wake_word}' wake word in "
                 f"{mode} mode): {heard}"
             )
+            self.log("[Voice] Route: REJECTED_NO_WAKE")
             return
         if spoken in IGNORE_UTTERANCES:
             self.log(f"[Voice] Rejected (ignore-utterance after wake): {spoken}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
             return
         if len(spoken) < 2:
             self.log(f"[Voice] Rejected (too short after wake): {spoken!r}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
+            return
+        # Pass T-B: re-run the junk gate against the post-wake-strip
+        # spoken text. The pre-route check above sees the full transcript
+        # ("hey simian amazon basin"), but a clean wake-word strip can
+        # leave the hallucination alone ("amazon basin"). Allow-listed
+        # short commands like "stop" still pass.
+        if self._is_junk(spoken):
+            self.log(f"[Voice] Rejected: low_confidence/junk transcript: {spoken}")
+            self.log("[Voice] Route: REJECTED_LOW_CONFIDENCE")
             return
         self.log(f"[Voice] Transcript queued for flush: {spoken}")
         self._queue_transcript(spoken, {"raw": heard, "hot_mode": self.hot_mode})

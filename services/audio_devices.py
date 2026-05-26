@@ -155,6 +155,119 @@ def list_replay_mic_choices() -> List[str]:
     return names
 
 
+def _wasapi_loopback_supported() -> bool:
+    """True iff the installed sounddevice exposes WasapiSettings(loopback=True).
+
+    Pass V-C: the Pass R-0 fix proved the kwarg shape changes between
+    sounddevice releases. We probe the constructor signature so the
+    desktop-audio strategy summary can tell the user "WASAPI loopback
+    available" vs "install a newer sounddevice / use VB-Cable" without
+    actually opening a stream (probing the stream would require an
+    output device to bounce off).
+    """
+    if sd is None:
+        return False
+    cls = getattr(sd, "WasapiSettings", None)
+    if cls is None:
+        return False
+    try:
+        import inspect
+        sig = inspect.signature(cls.__init__)
+        return "loopback" in sig.parameters
+    except Exception:
+        return False
+
+
+def detect_desktop_audio_strategy() -> Dict[str, Any]:
+    """Return the user's available desktop-audio capture paths.
+
+    Pass V-C: replaces the previous "auto-pick a single source" call
+    with a structured summary so the GUI / diagnostics block can list
+    every working path and surface a clear setup hint when none are
+    found. The returned dict is purely descriptive; nothing here opens
+    a stream or starts ffmpeg.
+
+    Keys:
+      - ``stereo_mix``    : ``Optional[str]`` -- exact dshow name when
+                            Stereo Mix is enabled, else None.
+      - ``what_u_hear``   : ``Optional[str]`` -- SoundBlaster equivalent.
+      - ``vb_cable``      : ``Optional[str]`` -- first dshow OR
+                            sounddevice match for VB-Audio /
+                            Virtual Audio Capturer / Voicemeeter.
+      - ``wasapi_loopback`` : ``bool`` -- True iff the current
+                            sounddevice build supports
+                            ``WasapiSettings(loopback=True)``.
+      - ``available``     : ``List[str]`` -- ordered list of every
+                            non-None path above (most reliable first).
+      - ``preferred``     : ``Optional[str]`` -- the top of
+                            ``available`` (or None if nothing works).
+      - ``diagnostic_message`` : ``str`` -- a one-line setup hint that
+                            the recorder can log when nothing works.
+    """
+    dshow_names = list_dshow_audio_devices()
+    sd_inputs = _sounddevice_input_names()
+
+    stereo_mix = None
+    what_u_hear = None
+    vb_cable = None
+
+    for name in dshow_names:
+        nlow = name.lower()
+        if stereo_mix is None and "stereo mix" in nlow:
+            stereo_mix = name
+        if what_u_hear is None and ("what u hear" in nlow or "wave out mix" in nlow):
+            what_u_hear = name
+        if vb_cable is None and VAC_HINT_RE.search(name):
+            vb_cable = name
+
+    if vb_cable is None:
+        for name in sd_inputs:
+            if VAC_HINT_RE.search(name):
+                vb_cable = name
+                break
+
+    wasapi_loopback = _wasapi_loopback_supported()
+
+    available: List[str] = []
+    # Most reliable first: VB-Cable / VAC > Stereo Mix > What U Hear
+    # > WASAPI loopback. WASAPI is last because its build-version
+    # dependency makes it the path most likely to disappear silently
+    # on a future sounddevice upgrade.
+    if vb_cable:
+        available.append(f"vb_cable: {vb_cable}")
+    if stereo_mix:
+        available.append(f"stereo_mix: {stereo_mix}")
+    if what_u_hear:
+        available.append(f"what_u_hear: {what_u_hear}")
+    if wasapi_loopback:
+        available.append("wasapi_loopback: <sounddevice loopback>")
+
+    preferred: Optional[str] = available[0].split(": ", 1)[1] if available else None
+
+    if available:
+        diagnostic_message = (
+            f"Desktop audio path available: {available[0]}. "
+            "If it sounds wrong, install VB-Cable for the cleanest capture."
+        )
+    else:
+        diagnostic_message = (
+            "Desktop audio unavailable: install/enable Stereo Mix "
+            "(Windows Sound -> Recording -> right-click -> Show Disabled "
+            "Devices -> enable 'Stereo Mix') or install VB-Cable "
+            "(https://vb-audio.com/Cable/). Mic audio will still record."
+        )
+
+    return {
+        "stereo_mix": stereo_mix,
+        "what_u_hear": what_u_hear,
+        "vb_cable": vb_cable,
+        "wasapi_loopback": wasapi_loopback,
+        "available": available,
+        "preferred": preferred,
+        "diagnostic_message": diagnostic_message,
+    }
+
+
 def pick_best_system_audio_choice() -> str:
     # Priority order:
     #   1. Virtual Audio Capturer (VAC) / VB-Audio / Voicemeeter --

@@ -550,6 +550,110 @@ class ReplayBufferRecorder:
         )
         return False
 
+    def _emit_device_diagnostics(self) -> None:
+        """Log a single contiguous block describing every audio source.
+
+        Pass V-D: bracketed by ``Device diagnostics start`` /
+        ``Device diagnostics end`` so the operator can grep one block
+        and see (a) what dshow sees, (b) what sounddevice sees, (c)
+        which mic auto-pick chose, (d) which desktop strategy is
+        available, and (e) which devices were rejected by the
+        blocklist. Best-effort: every sub-call is wrapped because we
+        do NOT want a missing dependency to derail replay startup.
+        """
+        self.log("[ReplayAudio] Device diagnostics start")
+
+        # dshow audio devices
+        try:
+            from services.audio_devices import list_dshow_audio_devices
+            ds = list_dshow_audio_devices()
+            if ds:
+                for n in ds:
+                    self.log(f"[ReplayAudio]   dshow audio: {n}")
+            else:
+                self.log("[ReplayAudio]   dshow audio: (none enumerated)")
+        except Exception as exc:
+            self.log(f"[ReplayAudio]   dshow audio: enumeration failed ({exc})")
+
+        # sounddevice inputs / outputs
+        try:
+            from services.audio_devices import list_sounddevice_devices
+            sd_info = list_sounddevice_devices()
+            for d in sd_info.get("inputs", []):
+                tag = " *default" if d.get("default") else ""
+                self.log(
+                    f"[ReplayAudio]   sounddevice in [{d.get('index')}]: "
+                    f"{d.get('name')}{tag}"
+                )
+            for d in sd_info.get("outputs", []):
+                tag = " *default" if d.get("default") else ""
+                self.log(
+                    f"[ReplayAudio]   sounddevice out[{d.get('index')}]: "
+                    f"{d.get('name')}{tag}"
+                )
+        except Exception as exc:
+            self.log(f"[ReplayAudio]   sounddevice: enumeration failed ({exc})")
+
+        # selected mic (auto-pick) + which devices the auto-pick rejected
+        try:
+            from services.audio_fallback_recorder import (
+                pick_best_mic_device,
+                MIC_AUTOPICK_BLOCKLIST,
+            )
+            picked = pick_best_mic_device(log_cb=lambda _m: None)
+            if picked and picked[0] is not None:
+                self.log(
+                    f"[ReplayAudio]   selected mic (auto-pick): {picked[1]!r} "
+                    f"(sd index {picked[0]})"
+                )
+            else:
+                self.log(
+                    "[ReplayAudio]   selected mic (auto-pick): OS default "
+                    "(no scored candidates)"
+                )
+            # Walk sounddevice inputs again and flag anyone the
+            # blocklist would have eliminated. Doesn't repeat the
+            # WASAPI / score work -- just shows the operator which
+            # surfaced names get skipped.
+            rejected: list[str] = []
+            try:
+                from services.audio_devices import list_sounddevice_devices as _ls
+                for d in _ls().get("inputs", []):
+                    nlow = (d.get("name") or "").lower()
+                    if any(b in nlow for b in MIC_AUTOPICK_BLOCKLIST):
+                        rejected.append(str(d.get("name")))
+            except Exception:
+                rejected = []
+            if rejected:
+                self.log(
+                    f"[ReplayAudio]   blocked from auto-pick: "
+                    f"{', '.join(rejected)}"
+                )
+            else:
+                self.log("[ReplayAudio]   blocked from auto-pick: (none)")
+        except Exception as exc:
+            self.log(f"[ReplayAudio]   mic auto-pick probe failed ({exc})")
+
+        # desktop audio strategy
+        try:
+            from services.audio_devices import detect_desktop_audio_strategy
+            strat = detect_desktop_audio_strategy()
+            avail = strat.get("available") or []
+            if avail:
+                self.log(
+                    f"[ReplayAudio]   desktop strategy: preferred="
+                    f"{strat.get('preferred')!r}; available={avail}"
+                )
+            else:
+                self.log(
+                    f"[ReplayAudio]   desktop strategy: NONE available -- "
+                    f"{strat.get('diagnostic_message')}"
+                )
+        except Exception as exc:
+            self.log(f"[ReplayAudio]   desktop strategy probe failed ({exc})")
+
+        self.log("[ReplayAudio] Device diagnostics end")
+
     def start(self) -> None:
         if self.is_running():
             self.log("[Replay] Buffer already running.")
@@ -559,6 +663,15 @@ class ReplayBufferRecorder:
         # export_last doesn't pick up an old WAV that doesn't line up
         # with the current segment buffer.
         self._last_fallback_paths = None
+
+        # Pass V-D: emit one diagnostics block before any audio choices
+        # are committed to ffmpeg. Lets the operator confirm the
+        # selected mic + desktop path before reading any
+        # rung-success/failure lines.
+        try:
+            self._emit_device_diagnostics()
+        except Exception as exc:
+            self.log(f"[ReplayAudio] device diagnostics raised ({exc}); continuing.")
 
         s = load_settings()
         buffer_dir = Path(s.buffer_dir).resolve()
@@ -971,6 +1084,169 @@ class ReplayBufferRecorder:
         detail = (proc.stderr or proc.stdout or "").strip()
         return proc.returncode == 0 and tmp_out.exists(), detail
 
+    def _resolve_ffprobe(self, ffmpeg: str) -> List[str]:
+        """Return ffprobe candidate paths to try, in order.
+
+        Prefers the sibling ``ffprobe(.exe)`` next to the resolved
+        ``ffmpeg`` (so the bundled ffmpeg-7.1.1 build wins on Windows),
+        then falls back to PATH.
+        """
+        candidates: List[str] = []
+        try:
+            ff_path = Path(ffmpeg)
+            if ff_path.is_absolute() or ff_path.exists():
+                sib = ff_path.parent / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+                if sib.exists():
+                    candidates.append(str(sib))
+        except Exception:
+            pass
+        candidates.append("ffprobe")
+        return candidates
+
+    def _probe_media_duration(self, ffmpeg: str, path: Path) -> Optional[float]:
+        """Return the container duration in seconds, or None on failure.
+
+        Pass V-B uses this for both the mic WAV and the exported MP4
+        so the AV-drift check has consistent numbers (rather than
+        comparing wave.getnframes/getframerate against an ffprobe
+        duration -- in practice they can disagree by ~50 ms because
+        ffmpeg sometimes pads PTS).
+        """
+        if not path.exists():
+            return None
+        for ffprobe in self._resolve_ffprobe(ffmpeg):
+            try:
+                proc = subprocess.run(
+                    [
+                        ffprobe, "-v", "error", "-show_entries",
+                        "format=duration", "-of", "csv=p=0", str(path),
+                    ],
+                    capture_output=True, text=True, timeout=15,
+                )
+            except FileNotFoundError:
+                continue
+            except Exception:
+                return None
+            out = (proc.stdout or "").strip()
+            if proc.returncode == 0 and out:
+                try:
+                    return float(out.splitlines()[0])
+                except Exception:
+                    return None
+        return None
+
+    def _probe_final_audio_stream(
+        self, ffmpeg: str, out_path: Path,
+    ) -> tuple[bool, Optional[str], Optional[int], Optional[int], Optional[float]]:
+        """Verify the exported MP4 actually contains an audio stream.
+
+        Pass U-B step 4 + Pass V-E enrichment. Returns
+        ``(has_audio, codec, samplerate, channels, duration_seconds)``.
+        Each field is None when the probe couldn't determine it. The
+        whole point of the fallback recorder + mux path is to
+        guarantee that exported clips are NOT silent, but the log
+        line that previously claimed "Final exported streams:
+        video + fallback-mic" was derived purely from which inputs we
+        thought we had handed ffmpeg -- if mux silently dropped the
+        audio (zero-byte WAV, codec mismatch, ``-shortest`` clipping it
+        away, etc.) the user only learned by trying to play the clip.
+
+        We probe the actual file. Prefer ``ffprobe`` (ships next to
+        ``ffmpeg.exe`` in the standard Windows build) and fall back to
+        parsing ``ffmpeg -i`` when ffprobe isn't on PATH or in the
+        bundled folder. Never raises -- on any error returns
+        ``(False, None, None, None, None)`` and logs.
+        """
+        empty: tuple[bool, Optional[str], Optional[int], Optional[int], Optional[float]] = (
+            False, None, None, None, None,
+        )
+        if not out_path.exists():
+            return empty
+        for ffprobe in self._resolve_ffprobe(ffmpeg):
+            try:
+                proc = subprocess.run(
+                    [
+                        ffprobe, "-v", "error", "-select_streams", "a",
+                        "-show_entries",
+                        "stream=codec_name,sample_rate,channels,duration",
+                        "-of", "csv=p=0", str(out_path),
+                    ],
+                    capture_output=True, text=True, timeout=15,
+                )
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                self.log(f"[Replay] ffprobe invocation failed ({exc}); will try ffmpeg -i.")
+                break
+            out = (proc.stdout or "").strip()
+            if proc.returncode == 0:
+                if not out:
+                    return empty
+                first = out.splitlines()[0].strip()
+                # csv format: codec_name,sample_rate,channels,duration
+                parts = [p.strip() for p in first.split(",")]
+                codec = parts[0] if len(parts) > 0 and parts[0] else None
+                samplerate: Optional[int] = None
+                channels: Optional[int] = None
+                duration: Optional[float] = None
+                try:
+                    if len(parts) > 1 and parts[1] and parts[1].upper() != "N/A":
+                        samplerate = int(float(parts[1]))
+                except Exception:
+                    samplerate = None
+                try:
+                    if len(parts) > 2 and parts[2] and parts[2].upper() != "N/A":
+                        channels = int(parts[2])
+                except Exception:
+                    channels = None
+                try:
+                    if len(parts) > 3 and parts[3] and parts[3].upper() != "N/A":
+                        duration = float(parts[3])
+                except Exception:
+                    duration = None
+                if duration is None:
+                    duration = self._probe_media_duration(ffmpeg, out_path)
+                return True, codec, samplerate, channels, duration
+            # Non-zero return -- continue to next candidate, then fallback.
+        # Fallback: ffmpeg -i and look for "Stream #...: Audio" in stderr.
+        try:
+            proc2 = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", str(out_path)],
+                capture_output=True, text=True, timeout=15,
+            )
+            text = (proc2.stderr or "") + (proc2.stdout or "")
+            for line in text.splitlines():
+                low = line.lower()
+                if "stream #" in low and "audio" in low:
+                    codec: Optional[str] = None
+                    samplerate = None
+                    channels = None
+                    try:
+                        idx = low.index("audio:")
+                        rest = line[idx + len("Audio:"):].strip()
+                        # rest looks like: "aac (LC), 44100 Hz, mono, fltp, 192 kb/s"
+                        tokens = [t.strip() for t in rest.split(",")]
+                        if tokens:
+                            codec = tokens[0].split()[0] or None
+                        for tok in tokens[1:]:
+                            tlow = tok.lower()
+                            if tlow.endswith(" hz"):
+                                try:
+                                    samplerate = int(tlow[:-3].strip())
+                                except Exception:
+                                    pass
+                            elif "mono" in tlow:
+                                channels = 1
+                            elif "stereo" in tlow:
+                                channels = 2
+                    except Exception:
+                        pass
+                    return True, codec, samplerate, channels, None
+            return empty
+        except Exception as exc:
+            self.log(f"[Replay] ffmpeg -i probe failed ({exc}); cannot verify final audio stream.")
+            return empty
+
     def _mux_fallback_audio(
         self,
         ffmpeg: str,
@@ -1093,15 +1369,88 @@ class ReplayBufferRecorder:
             concat_txt.unlink(missing_ok=True)
             raise RuntimeError("ffmpeg concat completed but no temporary clip was produced.")
 
-        # Pass Q: if the screen-only rung armed the Python fallback,
-        # mux those WAVs into the video before the (optional) upscale
-        # step. Replaces tmp_out in place so downstream paths don't
-        # change. Failure is non-fatal: we keep the silent video.
-        fb_paths = self._last_fallback_paths
+        # Pass Q / Pass U: if the screen-only rung armed the Python
+        # fallback, mux those WAVs into the video before the (optional)
+        # upscale step. Replaces tmp_out in place so downstream paths
+        # don't change. Failure is non-fatal: we keep the silent video.
+        #
+        # Pass U-B root cause fix: the previous version read
+        # ``_last_fallback_paths``, which is only populated by
+        # ``stop()`` -- so a clip taken while the buffer was still
+        # running always saw ``None`` and silently produced a
+        # video-only MP4 even though the fallback recorder was actively
+        # capturing mic. We now call ``fb.snapshot()`` to rotate the
+        # WAV files (finalize current ones, open fresh ones for ongoing
+        # capture) and use the returned snapshot paths for muxing.
+        fb_running = self._audio_fallback
+        if fb_running is not None:
+            try:
+                fb_paths = fb_running.snapshot()
+            except Exception as exc:
+                self.log(
+                    f"[Replay] Audio fallback snapshot failed ({exc}); "
+                    "falling back to last-finalized paths."
+                )
+                fb_paths = self._last_fallback_paths
+        else:
+            fb_paths = self._last_fallback_paths
         mic_w = getattr(fb_paths, "mic_wav", None) if fb_paths is not None else None
         desk_w = getattr(fb_paths, "desktop_wav", None) if fb_paths is not None else None
         muxed_streams: list[str] = ["video"]
         if mic_w or desk_w:
+            # Pass V-A: optionally normalize / gate the mic WAV before
+            # mux. Failure is non-fatal -- the original WAV stays
+            # available and we mux that instead.
+            if mic_w is not None:
+                try:
+                    from services.audio_fallback_recorder import preprocess_mic_wav
+                    processed_mic, gate_on, norm_on, peak_b, peak_a = preprocess_mic_wav(
+                        mic_w, log_cb=self.log,
+                    )
+                    if (gate_on or norm_on) and processed_mic and processed_mic.exists():
+                        mic_w = processed_mic
+                    self.log(
+                        f"[Replay] Mic preprocess summary: gate={'on' if gate_on else 'off'}, "
+                        f"normalize={'on' if norm_on else 'off'}, peak_before={peak_b:.3f}, "
+                        f"peak_after={peak_a:.3f}."
+                    )
+                except Exception as exc:
+                    self.log(f"[Replay] Mic preprocess raised ({exc}); using raw WAV.")
+
+            # Pass V-B: AV duration drift check. Probe the post-concat
+            # video duration and compare against the mic WAV duration.
+            # Drift > 0.75s (visible to a human listener) gets a
+            # warning; we keep ``-shortest`` in the mux step so the
+            # final clip never has a long trailing audio tail.
+            try:
+                vid_dur = self._probe_media_duration(ffmpeg, tmp_out)
+            except Exception:
+                vid_dur = None
+            mic_dur: Optional[float] = None
+            if mic_w is not None:
+                try:
+                    mic_dur = self._probe_media_duration(ffmpeg, mic_w)
+                except Exception:
+                    mic_dur = None
+            if vid_dur is not None and mic_dur is not None:
+                drift = abs(vid_dur - mic_dur)
+                if drift > 0.75:
+                    self.log(
+                        f"[ReplayAudio] AV duration drift: video={vid_dur:.2f}s "
+                        f"mic={mic_dur:.2f}s drift={drift:.2f}s. ffmpeg -shortest "
+                        "will trim trailing audio so the clip stays in sync; "
+                        "video is never cut."
+                    )
+                else:
+                    self.log(
+                        f"[ReplayAudio] AV duration check: video={vid_dur:.2f}s "
+                        f"mic={mic_dur:.2f}s drift={drift:.2f}s (within 0.75s)."
+                    )
+            self.log(
+                f"[Replay] Mux inputs ready: "
+                f"mic={mic_w.name if mic_w else 'none'}, "
+                f"desktop={desk_w.name if desk_w else 'none'}."
+            )
             tmp_muxed = (clips_dir / f"clip_{ts}_muxed.mp4").resolve()
             ok_mux, mux_detail = self._mux_fallback_audio(
                 ffmpeg, tmp_out, mic_w, desk_w, tmp_muxed
@@ -1125,6 +1474,14 @@ class ReplayBufferRecorder:
                     tmp_muxed.unlink(missing_ok=True)
                 except Exception:
                     pass
+        else:
+            # Pass U-B: explicit log line when the export skips audio so
+            # the user can grep for "audio skipped" and find the reason.
+            if fb_running is None and self._last_fallback_paths is None:
+                reason = "no audio fallback was armed (ffmpeg/dshow rung succeeded with audio, or user did not request audio)"
+            else:
+                reason = "fallback recorder produced no usable WAV (silent or empty after all retries)"
+            self.log(f"[Replay] Audio skipped at export: {reason}.")
 
         upscale = (upscale or "none").lower()
         if upscale in ("none", ""):
@@ -1171,5 +1528,63 @@ class ReplayBufferRecorder:
             f"[Replay] Final exported streams: {', '.join(muxed_streams)} "
             f"({len(muxed_streams)} input{'s' if len(muxed_streams) != 1 else ''})."
         )
+
+        # Pass U-B step 4 + Pass V-E: probe the final MP4 to verify it
+        # actually has the audio stream we think we muxed and surface
+        # the audio metadata (codec/samplerate/channels/duration) in
+        # the log so the operator can spot wrong sample rates or
+        # channel layouts at a glance.
+        try:
+            has_audio, audio_codec, audio_sr, audio_ch, audio_dur = (
+                self._probe_final_audio_stream(ffmpeg, out_path)
+            )
+        except Exception as exc:
+            has_audio, audio_codec, audio_sr, audio_ch, audio_dur = (
+                False, None, None, None, None,
+            )
+            self.log(f"[Replay] Final audio-stream probe raised ({exc}); cannot verify.")
+        expected_audio = len(muxed_streams) > 1
+
+        def _audio_meta_str() -> str:
+            bits = []
+            if audio_codec:
+                bits.append(f"codec={audio_codec}")
+            if audio_sr:
+                bits.append(f"sr={audio_sr}Hz")
+            if audio_ch:
+                bits.append(f"ch={audio_ch}")
+            if audio_dur is not None:
+                bits.append(f"dur={audio_dur:.2f}s")
+            return ", ".join(bits) if bits else "metadata unknown"
+
+        if has_audio and expected_audio:
+            # Pass V-E: spell out which streams the mux step actually
+            # contributed. The legacy log said "video + audio" but
+            # the operator wants to know whether the audio came from
+            # mic, desktop, or both.
+            stream_label = " + ".join(
+                s for s in muxed_streams if s != "video"
+            ).replace("fallback-mic", "mic").replace("fallback-desktop", "desktop")
+            self.log(
+                f"[Replay] Final exported streams verified: video + {stream_label} "
+                f"({_audio_meta_str()})."
+            )
+        elif has_audio and not expected_audio:
+            self.log(
+                f"[Replay] Final exported streams: ffprobe found an audio stream "
+                f"({_audio_meta_str()}) we did not intend to add."
+            )
+        elif not has_audio and expected_audio:
+            self.log(
+                "[Replay] Audio skipped at export: ffprobe confirms final MP4 has NO "
+                "audio stream despite the mux step succeeding. Likely causes: "
+                "(a) WAV inputs were zero-length / silent so amix produced no output; "
+                "(b) -shortest clipped audio to 0 because video had no PTS yet; "
+                "(c) the muxed temp file was overwritten by the upscale step without "
+                "carrying audio through."
+            )
+        else:
+            self.log("[Replay] Final exported streams verified: video only.")
+
         self.log(f"[Replay] Saved: {out_path}")
         return out_path
